@@ -14,6 +14,16 @@
 #include "DirectXRaytracingHelper.h"
 #include "CompiledShaders\Raytracing.hlsl.h"
 
+
+#include "./thirdparty/nvapi/nvapi.h"
+#include "./thirdparty/nvapi/nvShaderExtnEnums.h"
+#define NV_SHADER_EXTN_SLOT           999999   // pick an arbitrary unused slot 
+#define NV_SHADER_EXTN_REGISTER_SPACE 999999   // pick an arbitrary unused space 
+
+
+
+bool GSupportsShaderExecutionReordering = false;
+
 using namespace std;
 using namespace DX;
 
@@ -51,6 +61,24 @@ void D3D12RaytracingSimpleLighting::OnInit()
 
     m_deviceResources->CreateDeviceResources();
     m_deviceResources->CreateWindowSizeDependentResources();
+
+
+    const NvAPI_Status NvStatus = NvAPI_Initialize();
+    if (NvStatus == NVAPI_OK)
+    {
+        NvAPI_D3D12_IsNvShaderExtnOpCodeSupported(m_deviceResources->GetD3DDevice(), NV_EXTN_OP_HIT_OBJECT_REORDER_THREAD, &GSupportsShaderExecutionReordering);
+        if (!GSupportsShaderExecutionReordering)
+        {
+            /* Don't use SER */
+        }
+        else
+        {
+            NvAPI_D3D12_SetNvShaderExtnSlotSpace(m_deviceResources->GetD3DDevice(), NV_SHADER_EXTN_SLOT, NV_SHADER_EXTN_REGISTER_SPACE);
+        }
+    }
+
+    
+
 
     InitializeScene();
 
@@ -201,15 +229,21 @@ void D3D12RaytracingSimpleLighting::CreateRootSignatures()
     // Global Root Signature
     // This is a root signature that is shared across all raytracing shaders invoked during a DispatchRays() call.
     {
-        CD3DX12_DESCRIPTOR_RANGE ranges[2]; // Perfomance TIP: Order from most frequent to least frequent.
+        CD3DX12_DESCRIPTOR_RANGE ranges[3]; // Perfomance TIP: Order from most frequent to least frequent.
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);  // 1 output texture
         ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 1);  // 2 static index and vertex buffers.
 
-        CD3DX12_ROOT_PARAMETER rootParameters[GlobalRootSignatureParams::Count];
+        // fake UAV for shader execution reordering 
+        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, NV_SHADER_EXTN_SLOT, NV_SHADER_EXTN_REGISTER_SPACE);
+
+        CD3DX12_ROOT_PARAMETER rootParameters[GlobalRootSignatureParams::Count+1];
         rootParameters[GlobalRootSignatureParams::OutputViewSlot].InitAsDescriptorTable(1, &ranges[0]);
         rootParameters[GlobalRootSignatureParams::AccelerationStructureSlot].InitAsShaderResourceView(0);
         rootParameters[GlobalRootSignatureParams::SceneConstantSlot].InitAsConstantBufferView(0);
         rootParameters[GlobalRootSignatureParams::VertexBuffersSlot].InitAsDescriptorTable(1, &ranges[1]);
+
+        rootParameters[GlobalRootSignatureParams::Count].InitAsDescriptorTable(1, &ranges[2]);
+
         CD3DX12_ROOT_SIGNATURE_DESC globalRootSignatureDesc(ARRAYSIZE(rootParameters), rootParameters);
         SerializeAndCreateRaytracingRootSignature(globalRootSignatureDesc, &m_raytracingGlobalRootSignature);
     }
@@ -778,6 +812,9 @@ void D3D12RaytracingSimpleLighting::OnDestroy()
     // Let GPU finish before releasing D3D resources.
     m_deviceResources->WaitForGpu();
     OnDeviceLost();
+
+
+    NvAPI_Unload();
 }
 
 // Release all device dependent resouces when a device is lost.

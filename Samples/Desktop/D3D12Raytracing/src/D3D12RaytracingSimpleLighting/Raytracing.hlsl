@@ -15,6 +15,18 @@
 #define HLSL
 #include "RaytracingHlslCompat.h"
 
+
+#define NV_SER 1
+
+#ifdef NV_SER
+#define NV_HITOBJECT_USE_MACRO_API 1
+#define NV_SHADER_EXTN_SLOT           u999999       // matches slot number in NvAPI_D3D12_SetNvShaderExtnSlotSpace 
+#define NV_SHADER_EXTN_REGISTER_SPACE space999999   // matches space number in NvAPI_D3D12_SetNvShaderExtnSlotSpace 
+
+#include "thirdparty/nvapi/nvHLSLExtns.h" 
+#endif
+
+
 RaytracingAccelerationStructure Scene : register(t0, space0);
 RWTexture2D<float4> RenderTarget : register(u0);
 ByteAddressBuffer Indices : register(t1, space0);
@@ -122,11 +134,22 @@ void MyRaygenShader()
     ray.TMin = 0.001;
     ray.TMax = 10000.0;
     RayPayload payload = { float4(0, 0, 0, 0) };
-    TraceRay(Scene, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, ~0, 0, 1, 0, ray, payload);
+
+#ifdef NV_SER
+    NvHitObject hitObject;
+    NvTraceRayHitObject(Scene, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, ~0, 0, 1, 0, ray, payload, hitObject);
+
+    NvReorderThread(hitObject, 0, 0);
+    NvInvokeHitObject(Scene, hitObject, payload);
+#else
+   TraceRay(Scene, RAY_FLAG_CULL_BACK_FACING_TRIANGLES, ~0, 0, 1, 0, ray, payload);
+#endif
 
     // Write the raytraced color to the output texture.
     RenderTarget[DispatchRaysIndex().xy] = payload.color;
 }
+
+
 
 [shader("closesthit")]
 void MyClosestHitShader(inout RayPayload payload, in MyAttributes attr)
