@@ -141,6 +141,233 @@ void D3D12HelloTexture::LoadPipeline()
     ThrowIfFailed(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_commandAllocator)));
 }
 
+#include <dxcapi.h> // DXC
+void DxcCompile()
+{
+#if 0
+    ComPtr<IDxcCompiler3> dxcCompiler;
+    HRESULT hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
+    if (FAILED(hr))
+    {
+        // Print a message explaining that we cannot compile anything.
+        // This can happen when the user specifies a DXC version that is too old.
+        //lock_guard<mutex> guard(g_TaskMutex);
+        //static bool once = true;
+        //if (once)
+        //{
+         //   Printf(RED "ERROR: Cannot create an instance of IDxcCompiler3, HRESULT = 0x%08x (%s)\n", hr, std::system_category().message(hr).c_str());
+          //  once = false;
+        //}
+        //g_Terminate = true;
+        //return;
+    }
+
+    ComPtr<IDxcUtils> dxcUtils;
+    hr = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&dxcUtils));
+    if (FAILED(hr))
+    {
+        // Also print an error message.
+        // Not sure if this ever happens or all such cases are handled by the condition above, but let's be safe.
+        lock_guard<mutex> guard(g_TaskMutex);
+        static bool once = true;
+        if (once)
+        {
+            Printf(RED "ERROR: Cannot create an instance of IDxcUtils, HRESULT = 0x%08x (%s)\n", hr, std::system_category().message(hr).c_str());
+            once = false;
+        }
+        g_Terminate = true;
+        return;
+    }
+
+    while (!g_Terminate)
+    {
+        // Getting a task in the current thread
+        TaskData taskData;
+        {
+            lock_guard<mutex> guard(g_TaskMutex);
+            if (g_TaskData.empty())
+                return;
+
+            taskData = g_TaskData.back();
+            g_TaskData.pop_back();
+        }
+
+        // Compiling the shader
+        fs::path sourceFile = g_Options.configFile.parent_path() / g_Options.sourceDir / taskData.source;
+        wstring wsourceFile = sourceFile.wstring();
+
+        ComPtr<IDxcBlob> codeBlob;
+        ComPtr<IDxcBlobEncoding> errorBlob;
+        bool isSucceeded = false;
+
+        ComPtr<IDxcBlobEncoding> sourceBlob;
+        hr = dxcUtils->LoadFile(wsourceFile.c_str(), nullptr, &sourceBlob);
+
+        if (SUCCEEDED(hr))
+        {
+            vector<wstring> args;
+            args.reserve(16 + (g_Options.defines.size() + taskData.defines.size() + g_Options.includeDirs.size()) * 2
+                + (g_Options.platform == SPIRV ? regShifts.size() + g_Options.spirvExtensions.size() : 0));
+
+            // Source file
+            args.push_back(wsourceFile);
+
+            // Profile
+            args.push_back(L"-T");
+            args.push_back(AnsiToWide(taskData.profile + "_" + g_Options.shaderModel));
+
+            // Entry point
+            args.push_back(L"-E");
+            args.push_back(AnsiToWide(taskData.entryPoint));
+
+            // Defines
+            for (const string& define : g_Options.defines)
+            {
+                args.push_back(L"-D");
+                args.push_back(AnsiToWide(define));
+            }
+            for (const string& define : taskData.defines)
+            {
+                args.push_back(L"-D");
+                args.push_back(AnsiToWide(define));
+            }
+
+            // Include directories
+            for (const fs::path& path : g_Options.includeDirs)
+            {
+                args.push_back(L"-I");
+                args.push_back(path.wstring());
+            }
+
+            // Args
+            args.push_back(optimizationLevelRemap[taskData.optimizationLevel]);
+
+            uint32_t shaderModelIndex = (g_Options.shaderModel[0] - '0') * 10 + (g_Options.shaderModel[2] - '0');
+            if (shaderModelIndex >= 62)
+                args.push_back(L"-enable-16bit-types");
+
+            if (g_Options.warningsAreErrors)
+                args.push_back(DXC_ARG_WARNINGS_ARE_ERRORS);
+
+            if (g_Options.allResourcesBound)
+                args.push_back(DXC_ARG_ALL_RESOURCES_BOUND);
+
+            if (g_Options.matrixRowMajor)
+                args.push_back(DXC_ARG_PACK_MATRIX_ROW_MAJOR);
+
+            if (g_Options.hlsl2021)
+            {
+                args.push_back(L"-HV");
+                args.push_back(L"2021");
+            }
+
+            if (g_Options.pdb || g_Options.embedPdb)
+            {
+                // TODO: for SPIRV PDB can only be embedded, GetOutput(DXC_OUT_PDB) silently fails...
+                args.push_back(L"-Zi");
+                args.push_back(L"-Zsb"); // only binary code affects hash
+            }
+
+            if (g_Options.embedPdb)
+                args.push_back(L"-Qembed_debug");
+
+            if (g_Options.platform == SPIRV)
+            {
+                args.push_back(L"-spirv");
+                args.push_back(wstring(L"-fspv-target-env=vulkan") + AnsiToWide(g_Options.vulkanVersion));
+
+                if (g_Options.vulkanMemoryLayout)
+                    args.push_back(wstring(L"-fvk-use-") + AnsiToWide(g_Options.vulkanMemoryLayout) + wstring(L"-layout"));
+
+                for (const string& ext : g_Options.spirvExtensions)
+                    args.push_back(wstring(L"-fspv-extension=") + AnsiToWide(ext));
+
+                for (const wstring& arg : regShifts)
+                    args.push_back(arg);
+            }
+            else // Not supported by SPIRV gen
+            {
+                if (g_Options.stripReflection)
+                    args.push_back(L"-Qstrip_reflect");
+            }
+
+            for (string const& options : g_Options.compilerOptions)
+            {
+                TokenizeCompilerOptions(options.c_str(), args);
+            }
+
+            // Debug output
+            if (g_Options.verbose)
+            {
+                wstringstream cmd;
+                for (const wstring& arg : args)
+                {
+                    cmd << arg;
+                    cmd << L" ";
+                }
+
+                Printf(WHITE "%ls\n", cmd.str().c_str());
+            }
+
+            // Now that args are finalized, get their C-string pointers into a vector
+            vector<const wchar_t*> argPointers;
+            argPointers.reserve(args.size());
+            for (const wstring& arg : args)
+                argPointers.push_back(arg.c_str());
+
+            // Compiling the shader
+            DxcBuffer sourceBuffer = {};
+            sourceBuffer.Ptr = sourceBlob->GetBufferPointer();
+            sourceBuffer.Size = sourceBlob->GetBufferSize();
+
+            ComPtr<IDxcIncludeHandler> pDefaultIncludeHandler;
+            dxcUtils->CreateDefaultIncludeHandler(&pDefaultIncludeHandler);
+
+            ComPtr<IDxcResult> dxcResult;
+            hr = dxcCompiler->Compile(&sourceBuffer, argPointers.data(), (uint32_t)args.size(), pDefaultIncludeHandler.Get(), IID_PPV_ARGS(&dxcResult));
+
+            if (SUCCEEDED(hr))
+                dxcResult->GetStatus(&hr);
+
+            if (dxcResult)
+            {
+                dxcResult->GetResult(&codeBlob);
+                dxcResult->GetErrorBuffer(&errorBlob);
+            }
+
+            isSucceeded = SUCCEEDED(hr) && codeBlob;
+
+            // Dump PDB
+            if (isSucceeded && g_Options.pdb)
+            {
+                ComPtr<IDxcBlob> pdb;
+                ComPtr<IDxcBlobUtf16> pdbName;
+                if (SUCCEEDED(dxcResult->GetOutput(DXC_OUT_PDB, IID_PPV_ARGS(&pdb), &pdbName)))
+                {
+                    wstring file = fs::path(taskData.outputFileWithoutExt).parent_path().wstring() + L"/" + _L(PDB_DIR) + L"/" + wstring(pdbName->GetStringPointer());
+                    FILE* fp = _wfopen(file.c_str(), L"wb");
+                    if (fp)
+                    {
+                        fwrite(pdb->GetBufferPointer(), pdb->GetBufferSize(), 1, fp);
+                        fclose(fp);
+                    }
+                }
+            }
+        }
+
+        if (g_Terminate)
+            break;
+
+        // Dump output
+        if (isSucceeded)
+            DumpShader(taskData, (uint8_t*)codeBlob->GetBufferPointer(), codeBlob->GetBufferSize());
+
+        // Update progress
+        UpdateProgress(taskData, isSucceeded, false, errorBlob ? (char*)errorBlob->GetBufferPointer() : nullptr);
+    }
+#endif
+}
+
 // Load the sample assets.
 void D3D12HelloTexture::LoadAssets()
 {
@@ -188,19 +415,6 @@ void D3D12HelloTexture::LoadAssets()
 
     // Create the pipeline state, which includes compiling and loading shaders.
     {
-        ComPtr<ID3DBlob> vertexShader;
-        ComPtr<ID3DBlob> pixelShader;
-
-#if defined(_DEBUG)
-        // Enable better shader debugging with the graphics debugging tools.
-        UINT compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#else
-        UINT compileFlags = 0;
-#endif
-
-        ThrowIfFailed(D3DCompileFromFile(GetAssetFullPath(L"shaders.hlsl").c_str(), nullptr, nullptr, "VSMain", "vs_5_0", compileFlags, 0, &vertexShader, nullptr));
-        ThrowIfFailed(D3DCompileFromFile(GetAssetFullPath(L"shaders.hlsl").c_str(), nullptr, nullptr, "PSMain", "ps_5_0", compileFlags, 0, &pixelShader, nullptr));
-
         // Define the vertex input layout.
         D3D12_INPUT_ELEMENT_DESC inputElementDescs[] =
         {
@@ -212,8 +426,82 @@ void D3D12HelloTexture::LoadAssets()
         D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
         psoDesc.InputLayout = { inputElementDescs, _countof(inputElementDescs) };
         psoDesc.pRootSignature = m_rootSignature.Get();
+
+#if 0
+        ComPtr<ID3DBlob> vertexShader;
+        ComPtr<ID3DBlob> pixelShader;
+
+#if defined(_DEBUG)
+        // Enable better shader debugging with the graphics debugging tools.
+        UINT compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#else
+        UINT compileFlags = 0;
+#endif
+
+        ID3DBlob* errorBlob0 = nullptr;
+        ID3DBlob* errorBlob1 = nullptr;
+
+        HRESULT hr = D3DCompileFromFile(GetAssetFullPath(L"shaders.hlsl").c_str(), nullptr, nullptr, "VSMain", "vs_5_0", compileFlags, 0, &vertexShader, &errorBlob0);
+        D3DCompileFromFile(GetAssetFullPath(L"shaders.hlsl").c_str(), nullptr, nullptr, "PSMain", "ps_5_0", compileFlags, 0, &pixelShader, &errorBlob1);
+
+        if (FAILED(hr)) 
+        {
+            if (errorBlob0)
+            {
+                OutputDebugStringA((char*)errorBlob0->GetBufferPointer());
+                errorBlob0->Release();
+            }
+            ThrowIfFailed(hr);
+        }
+
         psoDesc.VS = CD3DX12_SHADER_BYTECODE(vertexShader.Get());
         psoDesc.PS = CD3DX12_SHADER_BYTECODE(pixelShader.Get());
+#endif
+
+#if 1
+        ComPtr<IDxcCompiler3> dxcCompiler;
+        ComPtr<IDxcLibrary> dxcLibrary;
+        DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
+        DxcCreateInstance(CLSID_DxcLibrary, IID_PPV_ARGS(&dxcLibrary));
+
+        ComPtr<IDxcBlobEncoding> sourceBlob;
+        dxcLibrary->CreateBlobFromFile(GetAssetFullPath(L"shaders.hlsl").c_str(), nullptr, &sourceBlob);
+
+        LPCWSTR vsArgs[] = { L"-T", L"vs_6_0", L"-E", L"VSMain" };
+        DxcBuffer sourceBuffer = { sourceBlob->GetBufferPointer(), sourceBlob->GetBufferSize(), DXC_CP_UTF8 };
+        ComPtr<IDxcResult> vsResult;
+        dxcCompiler->Compile(&sourceBuffer, vsArgs, _countof(vsArgs), nullptr, IID_PPV_ARGS(&vsResult));
+
+        LPCWSTR psArgs[] = { L"-T", L"ps_6_0", L"-E", L"PSMain" };
+        ComPtr<IDxcResult> psResult;
+        dxcCompiler->Compile(&sourceBuffer, psArgs, _countof(psArgs), nullptr, IID_PPV_ARGS(&psResult));
+
+        ComPtr<IDxcBlob> vertexShader;
+        ComPtr<IDxcBlob> pixelShader;
+        ComPtr<IDxcBlobUtf8> vsErrors;
+        ComPtr<IDxcBlobUtf8> psErrors;
+        vsResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&vertexShader), nullptr);
+        psResult->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&pixelShader), nullptr);
+        vsResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&vsErrors), nullptr);
+        psResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&psErrors), nullptr);
+
+        psoDesc.VS = { vertexShader->GetBufferPointer(), vertexShader->GetBufferSize() };
+        psoDesc.PS = { pixelShader->GetBufferPointer(), pixelShader->GetBufferSize() };
+
+        if (vsErrors)
+        {
+            OutputDebugStringA((char*)vsErrors->GetBufferPointer());
+            vsErrors->Release();
+        }
+        
+        if (psErrors)
+        {
+            OutputDebugStringA((char*)psErrors->GetBufferPointer());
+            psErrors->Release();
+        }
+        
+#endif        
+        
         psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
         psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
         psoDesc.DepthStencilState.DepthEnable = FALSE;
