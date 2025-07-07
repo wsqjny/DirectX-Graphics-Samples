@@ -9,6 +9,13 @@
 //
 //*********************************************************
 
+
+#define NETWORK_VERSION 2
+
+#include "ThirdParty/libntc/include/libntc/shaders/InferenceConstants.h"
+#include "ThirdParty/libntc/include/libntc/shaders/Inference.hlsli"
+typedef NtcNetworkParams<NETWORK_VERSION> NtcParams;
+
 struct PSInput
 {
     float4 position : SV_POSITION;
@@ -16,7 +23,14 @@ struct PSInput
 };
 
 Texture2D g_texture : register(t0);
+
+ByteAddressBuffer t_InputFile : register(t1);
+ByteAddressBuffer t_WeightBuffer : register(t2);
+StructuredBuffer<NtcTextureSetConstants> t_ConstantBuffer : register(t3);
+
+
 SamplerState g_sampler : register(s0);
+
 
 PSInput VSMain(float4 position : POSITION, float4 uv : TEXCOORD)
 {
@@ -28,7 +42,41 @@ PSInput VSMain(float4 position : POSITION, float4 uv : TEXCOORD)
     return result;
 }
 
+float3 SampleNTC(NtcTextureSetConstants g_NtcMaterial, ByteAddressBuffer t_InputFile, ByteAddressBuffer t_WeightBuffer, float2 uv)
+{
+    const int2 textureSize = NtcGetTextureDimensions(g_NtcMaterial, 0);
+    int2 texel = int2(floor(uv* textureSize));
+    int mipLevel = 0;
+
+    const bool linearizeColorsOnSample = false;
+
+    // Decompress the texel and get all the channels.
+    float channels[NtcParams::OUTPUT_CHANNELS];
+#ifdef USE_COOPVEC
+#if USE_FP8
+    NtcSampleTextureSet_CoopVec_FP8<NETWORK_VERSION>(g_NtcMaterial, t_InputFile, 0,
+        t_WeightBuffer, 0, texel, mipLevel, linearizeColorsOnSample, channels);
+#else
+    NtcSampleTextureSet_CoopVec_Int8<NETWORK_VERSION>(g_NtcMaterial, t_InputFile, 0,
+        t_WeightBuffer, 0, texel, mipLevel, linearizeColorsOnSample, channels);
+#endif
+#else
+    NtcSampleTextureSet<NETWORK_VERSION>(g_NtcMaterial, t_InputFile, 0,
+        t_WeightBuffer, 0, texel, mipLevel, linearizeColorsOnSample, channels);
+#endif
+
+    float3 baseOrDiffuse = 1;
+    baseOrDiffuse = float3(channels[0], channels[1], channels[2]);
+
+    return baseOrDiffuse;
+}
+
 float4 PSMain(PSInput input) : SV_TARGET
 {
-    return g_texture.Sample(g_sampler, input.uv);
+    //vector<int, 16> intArray;
+
+    //return g_texture.Sample(g_sampler, input.uv);
+
+    float3 sample_result = SampleNTC(t_ConstantBuffer[0], t_InputFile, t_WeightBuffer, input.uv);
+    return float4(sample_result, 1);
 }

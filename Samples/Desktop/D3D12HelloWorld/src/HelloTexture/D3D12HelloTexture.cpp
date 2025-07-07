@@ -12,6 +12,14 @@
 #include "stdafx.h"
 #include "D3D12HelloTexture.h"
 
+#include "libntc/ntc.h"
+#include "libntc/wrappers.h"
+
+#include <dxcapi.h> // DXC
+
+extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 717; }
+extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
+
 D3D12HelloTexture::D3D12HelloTexture(UINT width, UINT height, std::wstring name) :
     DXSample(width, height, name),
     m_frameIndex(0),
@@ -47,6 +55,9 @@ void D3D12HelloTexture::LoadPipeline()
     }
 #endif
 
+    UUID Features[] = { D3D12ExperimentalShaderModels, D3D12CooperativeVectorExperiment };
+    ThrowIfFailed(D3D12EnableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr));
+
     ComPtr<IDXGIFactory4> factory;
     ThrowIfFailed(CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&factory)));
 
@@ -70,9 +81,28 @@ void D3D12HelloTexture::LoadPipeline()
             hardwareAdapter.Get(),
             D3D_FEATURE_LEVEL_11_0,
             IID_PPV_ARGS(&m_device)
-            ));
+        ));
     }
 
+    D3D12_FEATURE_DATA_D3D12_OPTIONS_EXPERIMENTAL FeatureDataTier = {};
+    ThrowIfFailed(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS_EXPERIMENTAL,
+        &FeatureDataTier,
+        sizeof(FeatureDataTier)));
+    if (FeatureDataTier.CooperativeVectorTier >= D3D12_COOPERATIVE_VECTOR_TIER_1_0)
+    {
+        // Have Tier 1 cooperative vector support (there's also a Tier 1.1 for training operations)\
+
+        Microsoft::WRL::ComPtr<ID3D12DevicePreview> devicePreview;
+        m_device->QueryInterface(IID_PPV_ARGS(&devicePreview));
+
+        D3D12_LINEAR_ALGEBRA_MATRIX_CONVERSION_DEST_INFO convertInfo = { 0, D3D12_LINEAR_ALGEBRA_MATRIX_LAYOUT_MUL_OPTIMAL, 48, 64, 48, D3D12_LINEAR_ALGEBRA_DATATYPE_SINT8 };
+        devicePreview->GetLinearAlgebraMatrixConversionDestinationInfo(&convertInfo);
+        if (convertInfo.DestSize == 0)
+        {
+            m_osSupportsCoopVec = true;
+        }
+    }
+    
     // Describe and create the command queue.
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
@@ -117,12 +147,13 @@ void D3D12HelloTexture::LoadPipeline()
 
         // Describe and create a shader resource view (SRV) heap for the texture.
         D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-        srvHeapDesc.NumDescriptors = 1;
+        srvHeapDesc.NumDescriptors = 10;
         srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&m_srvHeap)));
 
         m_rtvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        m_cbv_srv_uavDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 
     // Create frame resources.
@@ -141,233 +172,6 @@ void D3D12HelloTexture::LoadPipeline()
     ThrowIfFailed(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_commandAllocator)));
 }
 
-#include <dxcapi.h> // DXC
-void DxcCompile()
-{
-#if 0
-    ComPtr<IDxcCompiler3> dxcCompiler;
-    HRESULT hr = DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
-    if (FAILED(hr))
-    {
-        // Print a message explaining that we cannot compile anything.
-        // This can happen when the user specifies a DXC version that is too old.
-        //lock_guard<mutex> guard(g_TaskMutex);
-        //static bool once = true;
-        //if (once)
-        //{
-         //   Printf(RED "ERROR: Cannot create an instance of IDxcCompiler3, HRESULT = 0x%08x (%s)\n", hr, std::system_category().message(hr).c_str());
-          //  once = false;
-        //}
-        //g_Terminate = true;
-        //return;
-    }
-
-    ComPtr<IDxcUtils> dxcUtils;
-    hr = DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&dxcUtils));
-    if (FAILED(hr))
-    {
-        // Also print an error message.
-        // Not sure if this ever happens or all such cases are handled by the condition above, but let's be safe.
-        lock_guard<mutex> guard(g_TaskMutex);
-        static bool once = true;
-        if (once)
-        {
-            Printf(RED "ERROR: Cannot create an instance of IDxcUtils, HRESULT = 0x%08x (%s)\n", hr, std::system_category().message(hr).c_str());
-            once = false;
-        }
-        g_Terminate = true;
-        return;
-    }
-
-    while (!g_Terminate)
-    {
-        // Getting a task in the current thread
-        TaskData taskData;
-        {
-            lock_guard<mutex> guard(g_TaskMutex);
-            if (g_TaskData.empty())
-                return;
-
-            taskData = g_TaskData.back();
-            g_TaskData.pop_back();
-        }
-
-        // Compiling the shader
-        fs::path sourceFile = g_Options.configFile.parent_path() / g_Options.sourceDir / taskData.source;
-        wstring wsourceFile = sourceFile.wstring();
-
-        ComPtr<IDxcBlob> codeBlob;
-        ComPtr<IDxcBlobEncoding> errorBlob;
-        bool isSucceeded = false;
-
-        ComPtr<IDxcBlobEncoding> sourceBlob;
-        hr = dxcUtils->LoadFile(wsourceFile.c_str(), nullptr, &sourceBlob);
-
-        if (SUCCEEDED(hr))
-        {
-            vector<wstring> args;
-            args.reserve(16 + (g_Options.defines.size() + taskData.defines.size() + g_Options.includeDirs.size()) * 2
-                + (g_Options.platform == SPIRV ? regShifts.size() + g_Options.spirvExtensions.size() : 0));
-
-            // Source file
-            args.push_back(wsourceFile);
-
-            // Profile
-            args.push_back(L"-T");
-            args.push_back(AnsiToWide(taskData.profile + "_" + g_Options.shaderModel));
-
-            // Entry point
-            args.push_back(L"-E");
-            args.push_back(AnsiToWide(taskData.entryPoint));
-
-            // Defines
-            for (const string& define : g_Options.defines)
-            {
-                args.push_back(L"-D");
-                args.push_back(AnsiToWide(define));
-            }
-            for (const string& define : taskData.defines)
-            {
-                args.push_back(L"-D");
-                args.push_back(AnsiToWide(define));
-            }
-
-            // Include directories
-            for (const fs::path& path : g_Options.includeDirs)
-            {
-                args.push_back(L"-I");
-                args.push_back(path.wstring());
-            }
-
-            // Args
-            args.push_back(optimizationLevelRemap[taskData.optimizationLevel]);
-
-            uint32_t shaderModelIndex = (g_Options.shaderModel[0] - '0') * 10 + (g_Options.shaderModel[2] - '0');
-            if (shaderModelIndex >= 62)
-                args.push_back(L"-enable-16bit-types");
-
-            if (g_Options.warningsAreErrors)
-                args.push_back(DXC_ARG_WARNINGS_ARE_ERRORS);
-
-            if (g_Options.allResourcesBound)
-                args.push_back(DXC_ARG_ALL_RESOURCES_BOUND);
-
-            if (g_Options.matrixRowMajor)
-                args.push_back(DXC_ARG_PACK_MATRIX_ROW_MAJOR);
-
-            if (g_Options.hlsl2021)
-            {
-                args.push_back(L"-HV");
-                args.push_back(L"2021");
-            }
-
-            if (g_Options.pdb || g_Options.embedPdb)
-            {
-                // TODO: for SPIRV PDB can only be embedded, GetOutput(DXC_OUT_PDB) silently fails...
-                args.push_back(L"-Zi");
-                args.push_back(L"-Zsb"); // only binary code affects hash
-            }
-
-            if (g_Options.embedPdb)
-                args.push_back(L"-Qembed_debug");
-
-            if (g_Options.platform == SPIRV)
-            {
-                args.push_back(L"-spirv");
-                args.push_back(wstring(L"-fspv-target-env=vulkan") + AnsiToWide(g_Options.vulkanVersion));
-
-                if (g_Options.vulkanMemoryLayout)
-                    args.push_back(wstring(L"-fvk-use-") + AnsiToWide(g_Options.vulkanMemoryLayout) + wstring(L"-layout"));
-
-                for (const string& ext : g_Options.spirvExtensions)
-                    args.push_back(wstring(L"-fspv-extension=") + AnsiToWide(ext));
-
-                for (const wstring& arg : regShifts)
-                    args.push_back(arg);
-            }
-            else // Not supported by SPIRV gen
-            {
-                if (g_Options.stripReflection)
-                    args.push_back(L"-Qstrip_reflect");
-            }
-
-            for (string const& options : g_Options.compilerOptions)
-            {
-                TokenizeCompilerOptions(options.c_str(), args);
-            }
-
-            // Debug output
-            if (g_Options.verbose)
-            {
-                wstringstream cmd;
-                for (const wstring& arg : args)
-                {
-                    cmd << arg;
-                    cmd << L" ";
-                }
-
-                Printf(WHITE "%ls\n", cmd.str().c_str());
-            }
-
-            // Now that args are finalized, get their C-string pointers into a vector
-            vector<const wchar_t*> argPointers;
-            argPointers.reserve(args.size());
-            for (const wstring& arg : args)
-                argPointers.push_back(arg.c_str());
-
-            // Compiling the shader
-            DxcBuffer sourceBuffer = {};
-            sourceBuffer.Ptr = sourceBlob->GetBufferPointer();
-            sourceBuffer.Size = sourceBlob->GetBufferSize();
-
-            ComPtr<IDxcIncludeHandler> pDefaultIncludeHandler;
-            dxcUtils->CreateDefaultIncludeHandler(&pDefaultIncludeHandler);
-
-            ComPtr<IDxcResult> dxcResult;
-            hr = dxcCompiler->Compile(&sourceBuffer, argPointers.data(), (uint32_t)args.size(), pDefaultIncludeHandler.Get(), IID_PPV_ARGS(&dxcResult));
-
-            if (SUCCEEDED(hr))
-                dxcResult->GetStatus(&hr);
-
-            if (dxcResult)
-            {
-                dxcResult->GetResult(&codeBlob);
-                dxcResult->GetErrorBuffer(&errorBlob);
-            }
-
-            isSucceeded = SUCCEEDED(hr) && codeBlob;
-
-            // Dump PDB
-            if (isSucceeded && g_Options.pdb)
-            {
-                ComPtr<IDxcBlob> pdb;
-                ComPtr<IDxcBlobUtf16> pdbName;
-                if (SUCCEEDED(dxcResult->GetOutput(DXC_OUT_PDB, IID_PPV_ARGS(&pdb), &pdbName)))
-                {
-                    wstring file = fs::path(taskData.outputFileWithoutExt).parent_path().wstring() + L"/" + _L(PDB_DIR) + L"/" + wstring(pdbName->GetStringPointer());
-                    FILE* fp = _wfopen(file.c_str(), L"wb");
-                    if (fp)
-                    {
-                        fwrite(pdb->GetBufferPointer(), pdb->GetBufferSize(), 1, fp);
-                        fclose(fp);
-                    }
-                }
-            }
-        }
-
-        if (g_Terminate)
-            break;
-
-        // Dump output
-        if (isSucceeded)
-            DumpShader(taskData, (uint8_t*)codeBlob->GetBufferPointer(), codeBlob->GetBufferSize());
-
-        // Update progress
-        UpdateProgress(taskData, isSucceeded, false, errorBlob ? (char*)errorBlob->GetBufferPointer() : nullptr);
-    }
-#endif
-}
-
 // Load the sample assets.
 void D3D12HelloTexture::LoadAssets()
 {
@@ -383,12 +187,6 @@ void D3D12HelloTexture::LoadAssets()
             featureData.HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_0;
         }
 
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
-        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
-
-        CD3DX12_ROOT_PARAMETER1 rootParameters[1];
-        rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
-
         D3D12_STATIC_SAMPLER_DESC sampler = {};
         sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
         sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
@@ -403,6 +201,12 @@ void D3D12HelloTexture::LoadAssets()
         sampler.ShaderRegister = 0;
         sampler.RegisterSpace = 0;
         sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+
+        CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+        rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
 
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
         rootSignatureDesc.Init_1_1(_countof(rootParameters), rootParameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
@@ -458,7 +262,7 @@ void D3D12HelloTexture::LoadAssets()
         psoDesc.PS = CD3DX12_SHADER_BYTECODE(pixelShader.Get());
 #endif
 
-#if 1
+#if 0
         ComPtr<IDxcCompiler3> dxcCompiler;
         ComPtr<IDxcLibrary> dxcLibrary;
         DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&dxcCompiler));
@@ -467,14 +271,14 @@ void D3D12HelloTexture::LoadAssets()
         ComPtr<IDxcBlobEncoding> sourceBlob;
         dxcLibrary->CreateBlobFromFile(GetAssetFullPath(L"shaders.hlsl").c_str(), nullptr, &sourceBlob);
 
-        LPCWSTR vsArgs[] = { L"-T", L"vs_6_0", L"-E", L"VSMain" };
+        LPCWSTR vsArgs[] = { L"-T", L"vs_6_9", L"-E", L"VSMain",  L"-HV", L"2021"};
         DxcBuffer sourceBuffer = { sourceBlob->GetBufferPointer(), sourceBlob->GetBufferSize(), DXC_CP_UTF8 };
         ComPtr<IDxcResult> vsResult;
-        dxcCompiler->Compile(&sourceBuffer, vsArgs, _countof(vsArgs), nullptr, IID_PPV_ARGS(&vsResult));
+        HRESULT hr = dxcCompiler->Compile(&sourceBuffer, vsArgs, _countof(vsArgs), nullptr, IID_PPV_ARGS(&vsResult));
 
-        LPCWSTR psArgs[] = { L"-T", L"ps_6_0", L"-E", L"PSMain" };
+        LPCWSTR psArgs[] = { L"-T", L"ps_6_9", L"-E", L"PSMain", L"-HV", L"2021"};
         ComPtr<IDxcResult> psResult;
-        dxcCompiler->Compile(&sourceBuffer, psArgs, _countof(psArgs), nullptr, IID_PPV_ARGS(&psResult));
+        hr = dxcCompiler->Compile(&sourceBuffer, psArgs, _countof(psArgs), nullptr, IID_PPV_ARGS(&psResult));
 
         ComPtr<IDxcBlob> vertexShader;
         ComPtr<IDxcBlob> pixelShader;
@@ -485,23 +289,33 @@ void D3D12HelloTexture::LoadAssets()
         vsResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&vsErrors), nullptr);
         psResult->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&psErrors), nullptr);
 
-        psoDesc.VS = { vertexShader->GetBufferPointer(), vertexShader->GetBufferSize() };
-        psoDesc.PS = { pixelShader->GetBufferPointer(), pixelShader->GetBufferSize() };
-
         if (vsErrors)
         {
             OutputDebugStringA((char*)vsErrors->GetBufferPointer());
             vsErrors->Release();
         }
-        
+
         if (psErrors)
         {
             OutputDebugStringA((char*)psErrors->GetBufferPointer());
             psErrors->Release();
         }
-        
+
+        psoDesc.VS = { vertexShader->GetBufferPointer(), vertexShader->GetBufferSize() };
+        psoDesc.PS = { pixelShader->GetBufferPointer(), pixelShader->GetBufferSize() };        
 #endif        
         
+#if 1
+        ComPtr<ID3DBlob> vertexShader;
+        ComPtr<ID3DBlob> pixelShader;
+
+        D3DReadFileToBlob(L"compiled/VSMain.cso", &vertexShader);
+        D3DReadFileToBlob(L"compiled/PSMain.cso", &pixelShader);
+
+        psoDesc.VS = { vertexShader->GetBufferPointer(), vertexShader->GetBufferSize() };
+        psoDesc.PS = { pixelShader->GetBufferPointer(), pixelShader->GetBufferSize() };
+#endif
+
         psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
         psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
         psoDesc.DepthStencilState.DepthEnable = FALSE;
@@ -519,6 +333,7 @@ void D3D12HelloTexture::LoadAssets()
 
     // Create the vertex buffer.
     {
+#if 0
         // Define the geometry for a triangle.
         Vertex triangleVertices[] =
         {
@@ -526,8 +341,21 @@ void D3D12HelloTexture::LoadAssets()
             { { 0.25f, -0.25f * m_aspectRatio, 0.0f }, { 1.0f, 1.0f } },
             { { -0.25f, -0.25f * m_aspectRatio, 0.0f }, { 0.0f, 1.0f } }
         };
+#endif
 
-        const UINT vertexBufferSize = sizeof(triangleVertices);
+        // Draw full screen quad.
+        Vertex fullscreenQuad[] =
+        {
+            { { -1.0f,  1.0f, 0.0f },           { 0.0f, 0.0f } },
+            { {  1.0f,  1.0f, 0.0f },           { 1.0f, 0.0f } },
+            { { -1.0f, -1.0f, 0.0f },           { 0.0f, 1.0f } },
+
+            { { -1.0f, -1.0f, 0.0f },           { 0.0f, 1.0f } },
+            { {  1.0f,  1.0f, 0.0f },           { 1.0f, 0.0f } },
+            { {  1.0f, -1.0f, 0.0f },           { 1.0f, 1.0f } },
+        };
+
+        const UINT vertexBufferSize = sizeof(fullscreenQuad);
 
         // Note: using upload heaps to transfer static data like vert buffers is not 
         // recommended. Every time the GPU needs it, the upload heap will be marshalled 
@@ -545,7 +373,7 @@ void D3D12HelloTexture::LoadAssets()
         UINT8* pVertexDataBegin;
         CD3DX12_RANGE readRange(0, 0);        // We do not intend to read from this resource on the CPU.
         ThrowIfFailed(m_vertexBuffer->Map(0, &readRange, reinterpret_cast<void**>(&pVertexDataBegin)));
-        memcpy(pVertexDataBegin, triangleVertices, sizeof(triangleVertices));
+        memcpy(pVertexDataBegin, fullscreenQuad, sizeof(fullscreenQuad));
         m_vertexBuffer->Unmap(0, nullptr);
 
         // Initialize the vertex buffer view.
@@ -613,6 +441,8 @@ void D3D12HelloTexture::LoadAssets()
         srvDesc.Texture2D.MipLevels = 1;
         m_device->CreateShaderResourceView(m_texture.Get(), &srvDesc, m_srvHeap->GetCPUDescriptorHandleForHeapStart());
     }
+
+    LoadNTCFile();
     
     // Close the command list and execute it to begin the initial GPU setup.
     ThrowIfFailed(m_commandList->Close());
@@ -738,7 +568,7 @@ void D3D12HelloTexture::PopulateCommandList()
     m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->IASetVertexBuffers(0, 1, &m_vertexBufferView);
-    m_commandList->DrawInstanced(3, 1, 0, 0);
+    m_commandList->DrawInstanced(6, 1, 0, 0);
 
     // Indicate that the back buffer will now be used to present.
     m_commandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_renderTargets[m_frameIndex].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
@@ -766,4 +596,212 @@ void D3D12HelloTexture::WaitForPreviousFrame()
     }
 
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+}
+
+
+inline void log_warning(const char* fmt, ...)
+{
+    constexpr int BufferSize = 1024;
+    char buffer[BufferSize];
+
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, BufferSize, fmt, args);
+    va_end(args);
+
+    fprintf(stderr, "[Warning] %s\n", buffer);
+}
+
+inline void log_error(const char* fmt, ...)
+{
+    log_warning(fmt);
+}
+
+
+GPUBufferWithSRV CreateStructuredOrRawSRVBuffer(
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* cmdList,
+    SIZE_T dataSize,
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpuHandle,
+    bool isStructuredBuffer = false,
+    UINT structureStride = 0)
+{
+    GPUBufferWithSRV result = {};
+    result.SrvCpuHandle = srvCpuHandle;
+
+    D3D12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(
+        dataSize,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    ThrowIfFailed(device->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&result.Buffer)));
+
+    ThrowIfFailed(device->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+        D3D12_HEAP_FLAG_NONE,
+        &CD3DX12_RESOURCE_DESC::Buffer(dataSize),
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&result.UploadBuffer)));
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Buffer.FirstElement = 0;
+    srvDesc.Buffer.NumElements = isStructuredBuffer ? (UINT)(dataSize / structureStride) : (UINT)(dataSize / 4);
+    srvDesc.Buffer.StructureByteStride = isStructuredBuffer ? structureStride : 0;
+    srvDesc.Format = isStructuredBuffer ? DXGI_FORMAT_UNKNOWN : DXGI_FORMAT_R32_TYPELESS;
+    srvDesc.Buffer.Flags = isStructuredBuffer ? D3D12_BUFFER_SRV_FLAG_NONE : D3D12_BUFFER_SRV_FLAG_RAW;
+
+    device->CreateShaderResourceView(result.Buffer.Get(), &srvDesc, srvCpuHandle);
+
+    return result;
+}
+
+void WriteBuffer(
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* cmdList,
+    const GPUBufferWithSRV& src,
+    const void* initData,
+    SIZE_T dataSize)
+{
+    void* mapped = nullptr;
+    ThrowIfFailed(src.UploadBuffer->Map(0, nullptr, &mapped));
+    memcpy(mapped, initData, dataSize);
+    src.UploadBuffer->Unmap(0, nullptr);
+
+    cmdList->CopyBufferRegion(src.Buffer.Get(), 0, src.UploadBuffer.Get(), 0, dataSize);
+}
+
+
+bool D3D12HelloTexture::LoadNTCFile()
+{
+    ntc::InferenceWeightType weightType = ntc::InferenceWeightType::GenericInt8;
+    bool enableCoopVecInt8 = true;
+    bool enableCoopVecFP8 = true;
+    const char* ntcFileName = "GlassPlasticMat.ntc";
+    
+    m_osSupportsCoopVec = false;
+
+    //-  Init context
+    ntc::ContextWrapper m_ntcContext;
+    ntc::ContextParameters contextParams;
+    contextParams.graphicsApi = ntc::GraphicsAPI::D3D12;
+    contextParams.d3d12Device = m_device.Get();
+    //contextParams.graphicsDeviceSupportsDP4a = false;// IsDP4aSupported(m_device);
+    //contextParams.graphicsDeviceSupportsFloat16 = true;// IsFloat16Supported(m_device);
+    //contextParams.enableCooperativeVectorInt8 = m_osSupportsCoopVec && enableCoopVecInt8;
+    //contextParams.enableCooperativeVectorFP8 = m_osSupportsCoopVec && enableCoopVecFP8;
+
+    ntc::Status ntcStatus = ntc::CreateContext(m_ntcContext.ptr(), contextParams);
+    if (ntcStatus != ntc::Status::Ok && ntcStatus != ntc::Status::CudaUnavailable)
+    {
+        log_error("Failed to create an NTC context, code = %s: ", ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+        return false;
+    }
+
+    //- Load Material
+    ntc::FileStreamWrapper ntcFileStream(m_ntcContext);
+    ntc::MemoryStreamWrapper ntcMemoryStream(m_ntcContext);
+    ntcStatus = m_ntcContext->OpenFile(ntcFileName, false, ntcFileStream.ptr());
+
+    ntc::IStream* stream = ntcFileStream.Get();
+
+    ntc::TextureSetMetadataWrapper textureSetMetadata(m_ntcContext);
+    ntcStatus = m_ntcContext->CreateTextureSetMetadataFromStream(stream, textureSetMetadata.ptr());
+    if (ntcStatus != ntc::Status::Ok)
+    {
+        log_warning("Cannot load metadata for '%s', error code = %s: %s", ntcFileName, ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+        return false;
+    }
+
+    int networkVersion = textureSetMetadata->GetNetworkVersion();
+
+    ntc::StreamRange latentStreamRange;
+    ntcStatus = textureSetMetadata->GetStreamRangeForLatents(0, textureSetMetadata->GetDesc().mips, latentStreamRange);
+    if (ntcStatus != ntc::Status::Ok)
+    {
+        log_warning("Cannot process material, call to GetStreamRangeForLatents failed, error code = %s: %s", /*ntcMaterial->name.c_str()*/ ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+    }
+
+
+    //- PrepareMaterialForInferenceOnSample
+    ntc::InferenceData inferenceData;
+    ntcStatus = m_ntcContext->MakeInferenceData(textureSetMetadata, latentStreamRange, weightType, &inferenceData);
+    if (ntcStatus != ntc::Status::Ok)
+    {
+        log_warning("Failed to make inference data for material, error code = %s: %s",
+            /*material.name.c_str(), */ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+        return false;
+    }
+
+    void const* weightData = nullptr;
+    size_t weightSize = 0;
+    size_t convertedWeightSize = 0;
+    ntcStatus = textureSetMetadata->GetInferenceWeights(weightType, &weightData, &weightSize, &convertedWeightSize);
+    if (ntcStatus != ntc::Status::Ok)
+    {
+        log_warning("Failed to get inference weights for material, error code = %s: %s",
+            /*material.name.c_str(), */ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+        return false;
+    }
+
+
+    std::vector<uint8_t> latentData;
+    latentData.resize(latentStreamRange.size);
+    ntcFileStream->Seek(latentStreamRange.offset);
+    if (!ntcFileStream->Read(latentData.data(), latentData.size()))
+    {
+        log_warning("Failed to read latents for materia");
+        return false;
+    }
+
+   
+    //- Create Buffer
+    D3D12_CPU_DESCRIPTOR_HANDLE handle0                 = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE handle_latantBuffer     = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 1, m_cbv_srv_uavDescriptorSize);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle_weightBuffer     = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 2, m_cbv_srv_uavDescriptorSize);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle_constantBuffer   = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 3, m_cbv_srv_uavDescriptorSize);
+
+    m_LatentBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), latentData.size(), handle_latantBuffer);
+    m_WeightBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), convertedWeightSize ? convertedWeightSize : weightSize, handle_weightBuffer);
+    m_ConstantBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), sizeof(inferenceData.constants), handle_constantBuffer, true, sizeof(inferenceData.constants));
+
+    WriteBuffer(m_device.Get(), m_commandList.Get(), m_LatentBuffer, latentData.data(), latentData.size());
+    WriteBuffer(m_device.Get(), m_commandList.Get(), m_ConstantBuffer, &inferenceData.constants, sizeof(inferenceData.constants));
+
+#if 0
+    if (convertedWeightSize != 0)
+    {
+        assert(m_weightUploadBuffer->getDesc().byteSize >= weightSize);
+        commandList->writeBuffer(m_weightUploadBuffer, weightData, weightSize);
+
+        commandList->setBufferState(m_weightUploadBuffer, nvrhi::ResourceStates::ShaderResource);
+        commandList->setBufferState(material.ntcWeightsBuffer, nvrhi::ResourceStates::UnorderedAccess);
+        commandList->commitBarriers();
+
+        bool const isVulkan = m_device->getGraphicsAPI() == nvrhi::GraphicsAPI::VULKAN;
+        nvrhi::ObjectType const commandListType = isVulkan
+            ? nvrhi::ObjectTypes::VK_CommandBuffer
+            : nvrhi::ObjectTypes::D3D12_GraphicsCommandList;
+        nvrhi::ObjectType const bufferType = isVulkan
+            ? nvrhi::ObjectTypes::VK_Buffer
+            : nvrhi::ObjectTypes::D3D12_Resource;
+
+        void* nativeCommandList = commandList->getNativeObject(commandListType);
+        void* nativeSrcBuffer = m_weightUploadBuffer->getNativeObject(bufferType);
+        void* nativeDstBuffer = material.ntcWeightsBuffer->getNativeObject(bufferType);
+
+        textureSetMetadata->ConvertInferenceWeights(weightType, nativeCommandList, nativeSrcBuffer, 0, nativeDstBuffer, 0);
+    }
+    else
+#endif
+    {
+        WriteBuffer(m_device.Get(), m_commandList.Get(), m_WeightBuffer, weightData, weightSize);
+    }
 }

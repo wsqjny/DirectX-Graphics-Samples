@@ -15,6 +15,13 @@
 
 using namespace DirectX;
 
+struct GPUBufferWithSRV
+{
+    ComPtr<ID3D12Resource> UploadBuffer;
+    ComPtr<ID3D12Resource> Buffer;
+    D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle;
+};
+
 // Note that while ComPtr is used to manage the lifetime of resources on the CPU,
 // it has no understanding of the lifetime of resources on the GPU. Apps must account
 // for the GPU lifetime of resources to avoid destroying objects that may still be
@@ -58,6 +65,7 @@ private:
     ComPtr<ID3D12PipelineState> m_pipelineState;
     ComPtr<ID3D12GraphicsCommandList> m_commandList;
     UINT m_rtvDescriptorSize;
+    UINT m_cbv_srv_uavDescriptorSize;
 
     // App resources.
     ComPtr<ID3D12Resource> m_vertexBuffer;
@@ -75,4 +83,14 @@ private:
     std::vector<UINT8> GenerateTextureData();
     void PopulateCommandList();
     void WaitForPreviousFrame();
+
+    //-
+    UINT descriptorSize;
+    bool m_osSupportsCoopVec;
+
+    GPUBufferWithSRV m_LatentBuffer;
+    GPUBufferWithSRV m_WeightBuffer;
+    GPUBufferWithSRV m_ConstantBuffer;
+
+    bool LoadNTCFile();
 };
