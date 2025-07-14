@@ -177,14 +177,15 @@
     <None Include="readme.md" />
   </ItemGroup>
   <ItemGroup>
-    <FxCompile Include="Raytracing.hlsl">
+    <Text Include="Raytracing.hlsl">
       <EnableDebuggingInformation Condition="'$(Configuration)'=='Debug'">true</EnableDebuggingInformation>
       <AdditionalOptions Condition="'$(Configuration)'=='Debug'">-Qembed_debug %(AdditionalOptions)</AdditionalOptions>
       <ShaderType>Library</ShaderType>
       <ShaderModel>6.3</ShaderModel>
       <VariableName>g_p%(Filename)</VariableName>
       <HeaderFileOutput>$(IntDir)CompiledShaders\%(Filename).hlsl.h</HeaderFileOutput>
-    </FxCompile>
+      <FileType>Document</FileType>
+    </Text>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
