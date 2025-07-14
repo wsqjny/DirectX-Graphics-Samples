@@ -91,6 +91,7 @@ private:
     GPUBufferWithSRV m_LatentBuffer;
     GPUBufferWithSRV m_WeightBuffer;
     GPUBufferWithSRV m_ConstantBuffer;
+    ComPtr<ID3D12Resource> m_UploadBuffer;
 
     bool LoadNTCFile();
 };

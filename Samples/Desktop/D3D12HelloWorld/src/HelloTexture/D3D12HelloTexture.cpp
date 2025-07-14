@@ -680,23 +680,23 @@ void WriteBuffer(
 
 
 bool D3D12HelloTexture::LoadNTCFile()
-{
-    ntc::InferenceWeightType weightType = ntc::InferenceWeightType::GenericInt8;
+{    
     bool enableCoopVecInt8 = true;
     bool enableCoopVecFP8 = true;
     const char* ntcFileName = "GlassPlasticMat.ntc";
     
-    m_osSupportsCoopVec = false;
+    m_osSupportsCoopVec = true;
+    ntc::InferenceWeightType weightType = m_osSupportsCoopVec ? ntc::InferenceWeightType::CoopVecFP8 : ntc::InferenceWeightType::GenericInt8;
 
     //-  Init context
     ntc::ContextWrapper m_ntcContext;
     ntc::ContextParameters contextParams;
     contextParams.graphicsApi = ntc::GraphicsAPI::D3D12;
     contextParams.d3d12Device = m_device.Get();
-    //contextParams.graphicsDeviceSupportsDP4a = false;// IsDP4aSupported(m_device);
-    //contextParams.graphicsDeviceSupportsFloat16 = true;// IsFloat16Supported(m_device);
-    //contextParams.enableCooperativeVectorInt8 = m_osSupportsCoopVec && enableCoopVecInt8;
-    //contextParams.enableCooperativeVectorFP8 = m_osSupportsCoopVec && enableCoopVecFP8;
+    contextParams.graphicsDeviceSupportsDP4a = true;// IsDP4aSupported(m_device);
+    contextParams.graphicsDeviceSupportsFloat16 = true;// IsFloat16Supported(m_device);
+    contextParams.enableCooperativeVectorInt8 = m_osSupportsCoopVec && enableCoopVecInt8;
+    contextParams.enableCooperativeVectorFP8 = m_osSupportsCoopVec && enableCoopVecFP8;
 
     ntc::Status ntcStatus = ntc::CreateContext(m_ntcContext.ptr(), contextParams);
     if (ntcStatus != ntc::Status::Ok && ntcStatus != ntc::Status::CudaUnavailable)
@@ -771,36 +771,42 @@ bool D3D12HelloTexture::LoadNTCFile()
     m_LatentBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), latentData.size(), handle_latantBuffer);
     m_WeightBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), convertedWeightSize ? convertedWeightSize : weightSize, handle_weightBuffer);
     m_ConstantBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), sizeof(inferenceData.constants), handle_constantBuffer, true, sizeof(inferenceData.constants));
-
+   
     WriteBuffer(m_device.Get(), m_commandList.Get(), m_LatentBuffer, latentData.data(), latentData.size());
     WriteBuffer(m_device.Get(), m_commandList.Get(), m_ConstantBuffer, &inferenceData.constants, sizeof(inferenceData.constants));
 
-#if 0
     if (convertedWeightSize != 0)
     {
-        assert(m_weightUploadBuffer->getDesc().byteSize >= weightSize);
-        commandList->writeBuffer(m_weightUploadBuffer, weightData, weightSize);
 
-        commandList->setBufferState(m_weightUploadBuffer, nvrhi::ResourceStates::ShaderResource);
-        commandList->setBufferState(material.ntcWeightsBuffer, nvrhi::ResourceStates::UnorderedAccess);
-        commandList->commitBarriers();
+        D3D12_HEAP_PROPERTIES dhp = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+        D3D12_RESOURCE_DESC drd = CD3DX12_RESOURCE_DESC::Buffer(65536);
 
-        bool const isVulkan = m_device->getGraphicsAPI() == nvrhi::GraphicsAPI::VULKAN;
-        nvrhi::ObjectType const commandListType = isVulkan
-            ? nvrhi::ObjectTypes::VK_CommandBuffer
-            : nvrhi::ObjectTypes::D3D12_GraphicsCommandList;
-        nvrhi::ObjectType const bufferType = isVulkan
-            ? nvrhi::ObjectTypes::VK_Buffer
-            : nvrhi::ObjectTypes::D3D12_Resource;
+        // 1. create upload weight buffer.
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+            D3D12_HEAP_FLAG_NONE,
+            &CD3DX12_RESOURCE_DESC::Buffer(65536),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&m_UploadBuffer)));
 
-        void* nativeCommandList = commandList->getNativeObject(commandListType);
-        void* nativeSrcBuffer = m_weightUploadBuffer->getNativeObject(bufferType);
-        void* nativeDstBuffer = material.ntcWeightsBuffer->getNativeObject(bufferType);
+        // 2. Fill upload buffer.
+        void* mapped = nullptr;
+        ThrowIfFailed(m_UploadBuffer->Map(0, nullptr, &mapped));
+        memcpy(mapped, weightData, weightSize);
+        m_UploadBuffer->Unmap(0, nullptr);
+
+        //commandList->setBufferState(m_weightUploadBuffer, nvrhi::ResourceStates::ShaderResource);
+        //commandList->setBufferState(material.ntcWeightsBuffer, nvrhi::ResourceStates::UnorderedAccess);
+        //commandList->commitBarriers();
+
+        void* nativeCommandList = m_commandList.Get();
+        void* nativeSrcBuffer = m_UploadBuffer.Get();
+        void* nativeDstBuffer = m_WeightBuffer.Buffer.Get();
 
         textureSetMetadata->ConvertInferenceWeights(weightType, nativeCommandList, nativeSrcBuffer, 0, nativeDstBuffer, 0);
     }
     else
-#endif
     {
         WriteBuffer(m_device.Get(), m_commandList.Get(), m_WeightBuffer, weightData, weightSize);
     }

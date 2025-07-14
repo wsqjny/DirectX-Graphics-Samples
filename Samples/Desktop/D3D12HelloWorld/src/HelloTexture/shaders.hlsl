@@ -10,10 +10,17 @@
 //*********************************************************
 
 
-#define NETWORK_VERSION 2
+#define NETWORK_VERSION 3
 
 #include "ThirdParty/libntc/include/libntc/shaders/InferenceConstants.h"
-#include "ThirdParty/libntc/include/libntc/shaders/Inference.hlsli"
+//#include "ThirdParty/libntc/include/libntc/shaders/Inference.hlsli"
+
+
+#define USE_COOPVEC
+#define USE_FP8 1
+
+#include "ThirdParty/libntc/include/libntc/shaders/InferenceCoopVec.hlsli"
+
 typedef NtcNetworkParams<NETWORK_VERSION> NtcParams;
 
 struct PSInput
