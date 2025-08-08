@@ -35,6 +35,8 @@ ByteAddressBuffer t_InputFile : register(t1);
 ByteAddressBuffer t_WeightBuffer : register(t2);
 StructuredBuffer<NtcTextureSetConstants> t_ConstantBuffer : register(t3);
 
+Buffer<uint> RayAllocator : register(t4);
+
 
 SamplerState g_sampler : register(s0);
 
@@ -84,6 +86,11 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     //return g_texture.Sample(g_sampler, input.uv);
 
-    float3 sample_result = SampleNTC(t_ConstantBuffer[0], t_InputFile, t_WeightBuffer, input.uv);
-    return float4(sample_result, 1);
+    //float3 sample_result = SampleNTC(t_ConstantBuffer[0], t_InputFile, t_WeightBuffer, input.uv);
+    //return float4(sample_result, 1);
+
+    if (RayAllocator[0] > 0)
+        return float4(1,0,0,1);
+
+    return float4(0, 0, 1, 1);
 }

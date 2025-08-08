@@ -1,0 +1,84 @@
+struct FTileData
+{
+	uint2 TileCoord;
+};
+struct FTileDataPacked
+{
+	uint PackedData;
+};
+FTileData UnpackTileData(FTileDataPacked TileDataPacked)
+{
+	FTileData TileData;
+	TileData.TileCoord.x = TileDataPacked.PackedData & 0xFFFF;
+	TileData.TileCoord.y = (TileDataPacked.PackedData >> 16) & 0xFFFF;
+	return TileData;
+}
+struct FRayData
+{
+	uint2 TraceCoord;
+};
+FRayData CreateRayData(uint2 TraceCoord)
+{
+	FRayData RayData;
+	RayData.TraceCoord = TraceCoord;
+	return RayData;
+}
+struct FRayDataPacked
+{
+	uint PackedData;
+};
+FRayDataPacked PackRayData(FRayData RayData)
+{
+	FRayDataPacked RayDataPacked;
+	RayDataPacked.PackedData = (RayData.TraceCoord.x & 0xFFFF) |
+		((RayData.TraceCoord.y & 0xFFFF) << 16);
+	return RayDataPacked;
+}
+
+Buffer<uint> TileAllocator : register(t0);
+StructuredBuffer<FTileDataPacked> TileDataPacked : register(t1);
+RWBuffer<uint> RWRayAllocator : register(u0);
+RWStructuredBuffer<FRayDataPacked> RWRayDataPacked : register(u1);
+
+groupshared uint SharedGroupOffset;
+groupshared uint SharedRayAllocator;
+groupshared FRayDataPacked SharedRayDataPacked[64];
+
+[numthreads(64, 1, 1)]
+void FLumenVisualizeCreateRaysCS(
+	uint2 GroupId : SV_GroupID,
+	uint GroupThreadId : SV_GroupThreadID)
+{
+	uint2 OutputViewSize = uint2(1280, 720);
+
+	SharedRayAllocator = 0;
+	GroupMemoryBarrierWithGroupSync();
+	uint LinearGroupId = GroupId.y * 128 + GroupId.x;
+	if (LinearGroupId < TileAllocator[0])
+	{
+		uint2 ThreadIndex = uint2(GroupThreadId % 8, GroupThreadId / 8);
+		FTileData TileData = UnpackTileData(TileDataPacked[LinearGroupId]);
+		uint2 TraceCoord = TileData.TileCoord * 8 + ThreadIndex;
+		if (all(TraceCoord < OutputViewSize))
+		{
+			bool bIsRayValid = true;
+			if (bIsRayValid)
+			{
+				uint ThreadOffset;
+				InterlockedAdd(SharedRayAllocator, 1, ThreadOffset);
+				SharedRayDataPacked[ThreadOffset] = PackRayData(CreateRayData(TraceCoord));
+			}
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (GroupThreadId == 0)
+	{
+		InterlockedAdd(RWRayAllocator[0], SharedRayAllocator, SharedGroupOffset);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (GroupThreadId < SharedRayAllocator)
+	{
+		FRayDataPacked RayDataPacked = SharedRayDataPacked[GroupThreadId];
+		RWRayDataPacked[SharedGroupOffset + GroupThreadId] = RayDataPacked;
+	}
+}

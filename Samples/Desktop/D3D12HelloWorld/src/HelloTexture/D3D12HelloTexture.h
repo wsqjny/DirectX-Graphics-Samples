@@ -22,6 +22,24 @@ struct GPUBufferWithSRV
     D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle;
 };
 
+
+
+struct GPUBufferWithSRV_NoUpload
+{
+    ComPtr<ID3D12Resource> Buffer;
+
+    D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle;
+    D3D12_CPU_DESCRIPTOR_HANDLE UavCpuHandle;
+
+    D3D12_GPU_DESCRIPTOR_HANDLE SrvGpuHandle;    
+    D3D12_GPU_DESCRIPTOR_HANDLE UavGpuHandle;
+
+    void SetSRVResourceHandle(uint32_t offset, UINT m_cbv_srv_uavDescriptorSize, ComPtr<ID3D12DescriptorHeap> m_srvHeap);
+    void SetUAVResourceHandle(uint32_t offset, UINT m_cbv_srv_uavDescriptorSize, ComPtr<ID3D12DescriptorHeap> m_srvHeap);
+    void CreateBuffer(ID3D12Device* device, UINT structureStride, UINT elementNum);
+};
+
+
 // Note that while ComPtr is used to manage the lifetime of resources on the CPU,
 // it has no understanding of the lifetime of resources on the GPU. Apps must account
 // for the GPU lifetime of resources to avoid destroying objects that may still be
@@ -93,5 +111,28 @@ private:
     GPUBufferWithSRV m_ConstantBuffer;
     ComPtr<ID3D12Resource> m_UploadBuffer;
 
+
+    GPUBufferWithSRV_NoUpload TileAllocatorBuffer;
+    GPUBufferWithSRV_NoUpload TileDataPackedStructuredBuffer;
+
+    GPUBufferWithSRV_NoUpload RayAllocatorBuffer;
+    GPUBufferWithSRV_NoUpload RayDataPackedStructuredBuffer;
+
+
+    ComPtr<ID3D12RootSignature> m_rootSignature_CS_CreateTile;
+    ComPtr<ID3D12PipelineState> m_pipelineState_CS_CreateTile;
+
+    ComPtr<ID3D12RootSignature> m_rootSignature_CS_CreateRay;
+    ComPtr<ID3D12PipelineState> m_pipelineState_CS_CreateRay;
+
+    ComPtr<ID3D12RootSignature> m_rootSignature_CS_TestOutput;
+    ComPtr<ID3D12PipelineState> m_pipelineState_CS_TestOutput;
+
     bool LoadNTCFile();
+
+
+    //- Test SM69 UE
+    void LoadAssets_UE_CS();
+    void _Execute_CS_CreateTile();
+    void _Execute_CS_CreateRay();
 };

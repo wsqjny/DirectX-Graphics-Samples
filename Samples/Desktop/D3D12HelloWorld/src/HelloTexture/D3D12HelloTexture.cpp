@@ -147,7 +147,7 @@ void D3D12HelloTexture::LoadPipeline()
 
         // Describe and create a shader resource view (SRV) heap for the texture.
         D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-        srvHeapDesc.NumDescriptors = 10;
+        srvHeapDesc.NumDescriptors = 50;
         srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&m_srvHeap)));
@@ -202,11 +202,13 @@ void D3D12HelloTexture::LoadAssets()
         sampler.RegisterSpace = 0;
         sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[2];
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
 
-        CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+        CD3DX12_ROOT_PARAMETER1 rootParameters[2];
         rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_PIXEL);
+        rootParameters[1].InitAsDescriptorTable(1, &ranges[1], D3D12_SHADER_VISIBILITY_PIXEL);
 
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
         rootSignatureDesc.Init_1_1(_countof(rootParameters), rootParameters, 1, &sampler, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
@@ -443,6 +445,7 @@ void D3D12HelloTexture::LoadAssets()
     }
 
     LoadNTCFile();
+    LoadAssets_UE_CS();
     
     // Close the command list and execute it to begin the initial GPU setup.
     ThrowIfFailed(m_commandList->Close());
@@ -547,6 +550,11 @@ void D3D12HelloTexture::PopulateCommandList()
     // re-recording.
     ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), m_pipelineState.Get()));
 
+    _Execute_CS_CreateTile();
+    _Execute_CS_CreateRay();
+
+    m_commandList->SetPipelineState(m_pipelineState.Get());
+
     // Set necessary state.
     m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
 
@@ -554,6 +562,8 @@ void D3D12HelloTexture::PopulateCommandList()
     m_commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
 
     m_commandList->SetGraphicsRootDescriptorTable(0, m_srvHeap->GetGPUDescriptorHandleForHeapStart());
+    m_commandList->SetGraphicsRootDescriptorTable(1, RayAllocatorBuffer.SrvGpuHandle);
+
     m_commandList->RSSetViewports(1, &m_viewport);
     m_commandList->RSSetScissorRects(1, &m_scissorRect);
 
@@ -663,6 +673,64 @@ GPUBufferWithSRV CreateStructuredOrRawSRVBuffer(
     return result;
 }
 
+
+void GPUBufferWithSRV_NoUpload::SetSRVResourceHandle(uint32_t offset, UINT m_cbv_srv_uavDescriptorSize, ComPtr<ID3D12DescriptorHeap> m_srvHeap)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle_cpu_start = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+	SrvCpuHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle_cpu_start, offset, m_cbv_srv_uavDescriptorSize);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE handle_gpu_start = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    SrvGpuHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(handle_gpu_start, offset, m_cbv_srv_uavDescriptorSize);
+}
+
+void GPUBufferWithSRV_NoUpload::SetUAVResourceHandle(uint32_t offset, UINT m_cbv_srv_uavDescriptorSize, ComPtr<ID3D12DescriptorHeap> m_srvHeap)
+{
+    D3D12_CPU_DESCRIPTOR_HANDLE handle_cpu_start = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    UavCpuHandle = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle_cpu_start, offset, m_cbv_srv_uavDescriptorSize);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE handle_gpu_start = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    UavGpuHandle = CD3DX12_GPU_DESCRIPTOR_HANDLE(handle_gpu_start, offset, m_cbv_srv_uavDescriptorSize);
+}
+
+void GPUBufferWithSRV_NoUpload::CreateBuffer(ID3D12Device* device, UINT structureStride, UINT elementNum)
+{
+    D3D12_RESOURCE_DESC desc = CD3DX12_RESOURCE_DESC::Buffer(
+        structureStride * elementNum,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    ThrowIfFailed(device->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        D3D12_RESOURCE_STATE_COMMON,
+        nullptr,
+        IID_PPV_ARGS(&Buffer)));
+
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Buffer.FirstElement = 0;
+    srvDesc.Buffer.NumElements = elementNum;
+    srvDesc.Buffer.StructureByteStride = structureStride;
+    srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+    srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+
+    device->CreateShaderResourceView(Buffer.Get(), &srvDesc, SrvCpuHandle);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uavDesc.Buffer.FirstElement = 0;
+    uavDesc.Buffer.NumElements = elementNum;
+    uavDesc.Buffer.StructureByteStride = structureStride;    
+    uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
+    device->CreateUnorderedAccessView(Buffer.Get(), nullptr, &uavDesc, UavCpuHandle);
+}
+
+
+
 void WriteBuffer(
     ID3D12Device* device,
     ID3D12GraphicsCommandList* cmdList,
@@ -678,6 +746,15 @@ void WriteBuffer(
     cmdList->CopyBufferRegion(src.Buffer.Get(), 0, src.UploadBuffer.Get(), 0, dataSize);
 }
 
+struct FTileDataPacked
+{
+    uint32_t PackedData;
+};
+
+struct FRayDataPacked
+{
+    uint32_t PackedData;
+};
 
 bool D3D12HelloTexture::LoadNTCFile()
 {    
@@ -763,15 +840,52 @@ bool D3D12HelloTexture::LoadNTCFile()
 
    
     //- Create Buffer
-    D3D12_CPU_DESCRIPTOR_HANDLE handle0                 = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE handle0                 = m_srvHeap->GetCPUDescriptorHandleForHeapStart();    
     D3D12_CPU_DESCRIPTOR_HANDLE handle_latantBuffer     = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 1, m_cbv_srv_uavDescriptorSize);
     D3D12_CPU_DESCRIPTOR_HANDLE handle_weightBuffer     = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 2, m_cbv_srv_uavDescriptorSize);
-    D3D12_CPU_DESCRIPTOR_HANDLE handle_constantBuffer   = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 3, m_cbv_srv_uavDescriptorSize);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle_constantBuffer   = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 3, m_cbv_srv_uavDescriptorSize);   
+    
 
+    TileAllocatorBuffer.                SetSRVResourceHandle(4, m_cbv_srv_uavDescriptorSize, m_srvHeap);
+	TileDataPackedStructuredBuffer.     SetSRVResourceHandle(5, m_cbv_srv_uavDescriptorSize, m_srvHeap);
+    RayAllocatorBuffer.                SetSRVResourceHandle(6, m_cbv_srv_uavDescriptorSize, m_srvHeap);
+    RayDataPackedStructuredBuffer.     SetSRVResourceHandle(7, m_cbv_srv_uavDescriptorSize, m_srvHeap);
+
+    TileAllocatorBuffer.                SetUAVResourceHandle(8, m_cbv_srv_uavDescriptorSize, m_srvHeap);
+    TileDataPackedStructuredBuffer.     SetUAVResourceHandle(9, m_cbv_srv_uavDescriptorSize, m_srvHeap);
+    RayAllocatorBuffer.                SetUAVResourceHandle(10, m_cbv_srv_uavDescriptorSize, m_srvHeap);
+    RayDataPackedStructuredBuffer.     SetUAVResourceHandle(11, m_cbv_srv_uavDescriptorSize, m_srvHeap);
+
+
+    int32_t TileCount[2];
+	TileCount[0] = m_viewport.Width / 8; // Assuming 8 is the tile size
+    TileCount[1] = m_viewport.Height / 8; // Assuming 8 is the tile size
+    
+    uint32_t MaxTileCount = TileCount[0] * TileCount[1];
+    TileDataPackedStructuredBuffer.CreateBuffer(m_device.Get(), sizeof(FTileDataPacked), MaxTileCount);
+    TileAllocatorBuffer.CreateBuffer(m_device.Get(), sizeof(uint32_t), 1);
+
+
+    UINT uav_clear_valule = 0;
+
+    // Generate rays
+    // NOTE: GroupCount for emulated indirect-dispatch of raygen shaders dictates the maximum allocation size if GroupCount > MaxTileCount
+    uint32_t RayGenThreadCount = 64;// CVarLumenVisualizeHardwareRayTracingThreadCount.GetValueOnRenderThread();
+    uint32_t RayGenGroupCount = 4096;// CVarLumenVisualizeHardwareRayTracingGroupCount.GetValueOnRenderThread();
+    uint32_t RayCount = max(MaxTileCount, RayGenGroupCount) * 64;// FMath::Max(MaxTileCount, RayGenGroupCount)* FLumenVisualizeCreateRaysCS::GetThreadGroupSize1D();
+
+    // Create rays within tiles
+    RayAllocatorBuffer.CreateBuffer(m_device.Get(), sizeof(uint32_t), 1);
+	m_commandList->ClearUnorderedAccessViewUint(RayAllocatorBuffer.UavGpuHandle, RayAllocatorBuffer.UavCpuHandle, RayAllocatorBuffer.Buffer.Get(), &uav_clear_valule, 0, nullptr);
+    
+    //AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(RayAllocatorBuffer, PF_R32_UINT), 0);
+
+    RayDataPackedStructuredBuffer.CreateBuffer(m_device.Get(), sizeof(FRayDataPacked), RayCount);// = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(LumenVisualize::FRayDataPacked), RayCount), TEXT("Lumen.Visualize.RayDataPacked"));
+        
     m_LatentBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), latentData.size(), handle_latantBuffer);
     m_WeightBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), convertedWeightSize ? convertedWeightSize : weightSize, handle_weightBuffer);
     m_ConstantBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), sizeof(inferenceData.constants), handle_constantBuffer, true, sizeof(inferenceData.constants));
-   
+ 
     WriteBuffer(m_device.Get(), m_commandList.Get(), m_LatentBuffer, latentData.data(), latentData.size());
     WriteBuffer(m_device.Get(), m_commandList.Get(), m_ConstantBuffer, &inferenceData.constants, sizeof(inferenceData.constants));
 
@@ -810,4 +924,111 @@ bool D3D12HelloTexture::LoadNTCFile()
     {
         WriteBuffer(m_device.Get(), m_commandList.Get(), m_WeightBuffer, weightData, weightSize);
     }
+}
+
+void D3D12HelloTexture::LoadAssets_UE_CS()
+{
+    // Create Tile
+    {
+        //- Create RootSignature
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+
+        CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+        rootParameters[0].InitAsDescriptorTable(1, &ranges[0]);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+        rootSignatureDesc.Init_1_1(_countof(rootParameters), rootParameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+        ComPtr<ID3DBlob> signature;
+        ComPtr<ID3DBlob> error;
+        ThrowIfFailed(D3DX12SerializeVersionedRootSignature(&rootSignatureDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &signature, &error));
+        ThrowIfFailed(m_device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&m_rootSignature_CS_CreateTile)));
+
+        //- Load Shaders
+        ComPtr<ID3DBlob> computeShader;
+        D3DReadFileToBlob(L"compiled/FLumenVisualizeCreateTilesCS.dxil", &computeShader);
+
+        //- CreatePSO
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = m_rootSignature_CS_CreateTile.Get();
+		psoDesc.CS = { computeShader->GetBufferPointer(), computeShader->GetBufferSize() };
+        psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;       
+        ThrowIfFailed(m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_pipelineState_CS_CreateTile)));
+    }
+
+    // Create Ray
+    {
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[2];
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+
+        CD3DX12_ROOT_PARAMETER1 rootParameters[2];
+        rootParameters[0].InitAsDescriptorTable(1, &ranges[0]);
+        rootParameters[1].InitAsDescriptorTable(1, &ranges[1]);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+        rootSignatureDesc.Init_1_1(_countof(rootParameters), rootParameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT);
+
+        ComPtr<ID3DBlob> signature;
+        ComPtr<ID3DBlob> error;
+        ThrowIfFailed(D3DX12SerializeVersionedRootSignature(&rootSignatureDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &signature, &error));
+        ThrowIfFailed(m_device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&m_rootSignature_CS_CreateRay)));
+
+        //- Load Shaders
+        ComPtr<ID3DBlob> computeShader;
+        D3DReadFileToBlob(L"compiled/FLumenVisualizeCreateRaysCS.dxil", &computeShader);
+
+        //- CreatePSO
+        D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = m_rootSignature_CS_CreateRay.Get();
+        psoDesc.CS = { computeShader->GetBufferPointer(), computeShader->GetBufferSize() };
+        psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+        ThrowIfFailed(m_device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_pipelineState_CS_CreateRay)));
+    }
+}
+
+void D3D12HelloTexture::_Execute_CS_CreateTile()
+{
+    m_commandList->SetPipelineState(m_pipelineState_CS_CreateTile.Get());
+    m_commandList->SetComputeRootSignature(m_rootSignature_CS_CreateTile.Get());
+
+    ID3D12DescriptorHeap* ppHeaps[] = { m_srvHeap.Get() };
+    m_commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+    
+    m_commandList->SetComputeRootDescriptorTable(0, TileAllocatorBuffer.UavGpuHandle);
+
+    int32_t TileCount[2];
+    TileCount[0] = m_viewport.Width / 8; // Assuming 8 is the tile size
+    TileCount[1] = m_viewport.Height / 8; // Assuming 8 is the tile size
+
+    m_commandList->Dispatch(TileCount[0], TileCount[1], 1);
+}
+
+void D3D12HelloTexture::_Execute_CS_CreateRay()
+{
+    m_commandList->SetPipelineState(m_pipelineState_CS_CreateRay.Get());
+    m_commandList->SetComputeRootSignature(m_rootSignature_CS_CreateRay.Get());
+
+    ID3D12DescriptorHeap* ppHeaps[] = { m_srvHeap.Get() };
+    m_commandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+    
+    m_commandList->SetComputeRootDescriptorTable(0, TileAllocatorBuffer.SrvGpuHandle);
+    m_commandList->SetComputeRootDescriptorTable(1, RayAllocatorBuffer.UavGpuHandle);
+
+
+    int32_t TileCount[2];
+    TileCount[0] = m_viewport.Width / 8; // Assuming 8 is the tile size
+    TileCount[1] = m_viewport.Height / 8; // Assuming 8 is the tile size
+
+    uint32_t MaxTileCount = TileCount[0] * TileCount[1];
+    // Generate rays
+    // NOTE: GroupCount for emulated indirect-dispatch of raygen shaders dictates the maximum allocation size if GroupCount > MaxTileCount
+    uint32_t RayGenThreadCount = 64;// CVarLumenVisualizeHardwareRayTracingThreadCount.GetValueOnRenderThread();
+    uint32_t RayGenGroupCount = 4096;// CVarLumenVisualizeHardwareRayTracingGroupCount.GetValueOnRenderThread();
+    uint32_t RayCount = max(MaxTileCount, RayGenGroupCount) * 64;// FMath::Max(MaxTileCount, RayGenGroupCount)* FLumenVisualizeCreateRaysCS::GetThreadGroupSize1D();
+
+    const int32_t VisualizeCreateRaysDispatchSizeX = 128;
+    const int32_t GroupY = RayCount / 64 / VisualizeCreateRaysDispatchSizeX;
+    m_commandList->Dispatch(VisualizeCreateRaysDispatchSizeX, GroupY, 1);
 }

@@ -1,0 +1,53 @@
+struct FTileData
+{
+	uint2 TileCoord;
+};
+FTileData CreateTileData(uint2 TileCoord)
+{
+	FTileData TileData;
+	TileData.TileCoord = TileCoord;
+	return TileData;
+}
+struct FTileDataPacked
+{
+	uint PackedData;
+};
+FTileDataPacked PackTileData(FTileData TileData)
+{
+	FTileDataPacked TileDataPacked;
+	TileDataPacked.PackedData = ((TileData.TileCoord.y & 0xFFFF) << 16) | (TileData.TileCoord.x & 0xFFFF);
+	return TileDataPacked;
+}
+
+RWBuffer<uint> RWTileAllocator : register(u0);
+RWStructuredBuffer<FTileDataPacked> RWTileDataPacked : register(u1);
+
+groupshared uint SharedTileNeedsTracing;
+
+[numthreads(8, 8, 1)]
+void FLumenVisualizeCreateTilesCS(
+	uint2 GroupId : SV_GroupID,
+	uint2 GroupThreadId : SV_GroupThreadID,
+	uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 OutputViewSize = uint2(1280, 720);
+
+	SharedTileNeedsTracing = 0;
+	GroupMemoryBarrierWithGroupSync();
+	uint2 TraceCoord = DispatchThreadId.xy;
+	if (all(TraceCoord < OutputViewSize))
+	{
+		{
+			SharedTileNeedsTracing = 1;
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (GroupThreadId.x == 0 && GroupThreadId.y == 0 && SharedTileNeedsTracing > 0)
+	{
+		uint TileOffset;
+		InterlockedAdd(RWTileAllocator[0], 1, TileOffset);
+		FTileData TileData = CreateTileData(GroupId);
+		FTileDataPacked TileDataPacked = PackTileData(TileData);
+		RWTileDataPacked[TileOffset] = TileDataPacked;
+	}
+}
