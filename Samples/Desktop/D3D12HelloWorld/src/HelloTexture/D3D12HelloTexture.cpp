@@ -685,7 +685,7 @@ bool D3D12HelloTexture::LoadNTCFile()
     bool enableCoopVecFP8 = true;
     const char* ntcFileName = "GlassPlasticMat.ntc";
     
-    m_osSupportsCoopVec = true;
+    m_osSupportsCoopVec = false;
     ntc::InferenceWeightType weightType = m_osSupportsCoopVec ? ntc::InferenceWeightType::CoopVecFP8 : ntc::InferenceWeightType::GenericInt8;
 
     //-  Init context
@@ -720,10 +720,56 @@ bool D3D12HelloTexture::LoadNTCFile()
         return false;
     }
 
+    int mip_start = 5;
+    
     int networkVersion = textureSetMetadata->GetNetworkVersion();
 
     ntc::StreamRange latentStreamRange;
-    ntcStatus = textureSetMetadata->GetStreamRangeForLatents(0, textureSetMetadata->GetDesc().mips, latentStreamRange);
+    ntcStatus = textureSetMetadata->GetStreamRangeForLatents(mip_start, 1, latentStreamRange);
+
+
+
+
+
+    {
+        ntc::StreamRange latentStreamRange0;
+        
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(0, 12, latentStreamRange0);            // 35588, 2236928
+        
+        
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(0, 1, latentStreamRange0);             // 35588, 2097152
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(1, 1, latentStreamRange0);             // 35588, 2097152           
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(2, 1, latentStreamRange0);             // 35588, 2097152        
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(3, 1, latentStreamRange0);             // 35588, 2097152   
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(4, 1, latentStreamRange0);             // 2132740, 131072
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(5, 1, latentStreamRange0);             // 2132740, 131072     
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(6, 1, latentStreamRange0);             // 2263812, 8192      
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(7, 1, latentStreamRange0);             // 2263812, 8192      
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(8, 1, latentStreamRange0);             // 2272004, 512        
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(9, 1, latentStreamRange0);             // 2272004, 512      
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(10, 1, latentStreamRange0);            // 2272004, 512
+        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(11, 1, latentStreamRange0);            // 2272004, 512
+
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     if (ntcStatus != ntc::Status::Ok)
     {
         log_warning("Cannot process material, call to GetStreamRangeForLatents failed, error code = %s: %s", /*ntcMaterial->name.c_str()*/ ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());

@@ -16,8 +16,8 @@
 //#include "ThirdParty/libntc/include/libntc/shaders/Inference.hlsli"
 
 
-#define USE_COOPVEC
-#define USE_FP8 1
+//#define USE_COOPVEC
+//#define USE_FP8 1
 
 #include "ThirdParty/libntc/include/libntc/shaders/InferenceCoopVec.hlsli"
 
@@ -51,9 +51,11 @@ PSInput VSMain(float4 position : POSITION, float4 uv : TEXCOORD)
 
 float3 SampleNTC(NtcTextureSetConstants g_NtcMaterial, ByteAddressBuffer t_InputFile, ByteAddressBuffer t_WeightBuffer, float2 uv)
 {
-    const int2 textureSize = NtcGetTextureDimensions(g_NtcMaterial, 0);
+    int mipLevel = 5;
+
+    const int2 textureSize = NtcGetTextureDimensions(g_NtcMaterial, mipLevel);
     int2 texel = int2(floor(uv* textureSize));
-    int mipLevel = 0;
+    
 
     const bool linearizeColorsOnSample = false;
 
