@@ -17,9 +17,14 @@ using namespace DirectX;
 
 struct GPUBufferWithSRV
 {
-    ComPtr<ID3D12Resource> UploadBuffer;
     ComPtr<ID3D12Resource> Buffer;
     D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle;
+};
+
+struct GPUTextureWithSRV
+{
+	ComPtr<ID3D12Resource> Texture;
+	D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle;
 };
 
 // Note that while ComPtr is used to manage the lifetime of resources on the CPU,
@@ -88,7 +93,7 @@ private:
     UINT descriptorSize;
     bool m_osSupportsCoopVec;
 
-    GPUBufferWithSRV m_LatentBuffer;
+    GPUTextureWithSRV m_LatentTexture;
     GPUBufferWithSRV m_WeightBuffer;
     GPUBufferWithSRV m_ConstantBuffer;
     ComPtr<ID3D12Resource> m_UploadBuffer;

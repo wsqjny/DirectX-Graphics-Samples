@@ -40,17 +40,9 @@ struct NtcDecompressConstants
 {
     NtcDecompressOutputDesc outputs[DECOMPRESS_CS_MAX_OUTPUTS];
 #ifdef __cplusplus
-    NtcLatentEncodingConstants highResEncoding;
-    NtcLatentEncodingConstants lowResEncoding;
-    NtcNeuralMipConstants highResNeuralMip;
-    NtcNeuralMipConstants lowResNeuralMip;
     NtcColorMipConstants colorMip;
     int networkWeightOffsets[4];
 #else
-    int4 highResEncoding[2];
-    int4 lowResEncoding[2];
-    int4 highResNeuralMip;
-    int4 lowResNeuralMip;
     int4 colorMip;
     int4 networkWeightOffsets;
 #endif

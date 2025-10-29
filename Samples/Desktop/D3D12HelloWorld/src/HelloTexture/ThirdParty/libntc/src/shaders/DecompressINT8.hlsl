@@ -13,23 +13,17 @@
 #include "DecompressCommon.hlsli"
    
 // Use manual allocation and addressing for shared memory to share the same memory
-// between latent preloading and matrix/scale/bias preloading because these actions
+// between matrix/scale/bias preloading and output shuffling because these actions
 // do not overlap.
 
-// First phase - latent preloading
-static const int HR_LATENT_BASE_ADDR = 0;
-static const int HR_LATENT_MEM_SIZE = (Params::HR_FEATURES / 4) * HR_LATENTS_WIDTH * HR_LATENTS_HEIGHT;
-static const int LR_LATENT_BASE_ADDR = HR_LATENT_MEM_SIZE;
-static const int LR_LATENT_MEM_SIZE = (Params::LR_FEATURES / 4) * LR_LATENTS_WIDTH * LR_LATENTS_HEIGHT;
-
-// Second phase - matrix and scale/bias preloading
+// First phase - matrix and scale/bias preloading
 static const int MATRIX_B_BASE_ADDR = 0;
 static const int MATRIX_B_MEM_SIZE = MAX_OUTPUT_SIZE * (MAX_INPUT_SIZE / 4);
 static const int SCALE_BIAS_SIZE = MAX_OUTPUT_SIZE;
 static const int BIAS_BASE_ADDR = MATRIX_B_MEM_SIZE;
 static const int SCALE_BASE_ADDR = BIAS_BASE_ADDR + SCALE_BIAS_SIZE;
 
-// Third phase - output shuffling
+// Second phase - output shuffling
 static const int OUTPUT_BASE_ADDR = 0;
 #if USE_FLOAT16
 static const int OUTPUT_UINTS = Params::OUTPUT_CHANNELS/2;
@@ -39,20 +33,10 @@ static const int OUTPUT_UINTS = Params::OUTPUT_CHANNELS;
 static const int OUTPUT_SIZE = DECOMPRESS_CS_BLOCK_WIDTH * DECOMPRESS_CS_BLOCK_HEIGHT * (OUTPUT_UINTS+1);
 
 // Calculate the total shared memory size and allocate it
-static const int SHARED_MEMORY_SIZE = max(OUTPUT_SIZE, max(HR_LATENT_MEM_SIZE + LR_LATENT_MEM_SIZE, MATRIX_B_MEM_SIZE + SCALE_BIAS_SIZE * 2));
+static const int SHARED_MEMORY_SIZE = max(OUTPUT_SIZE, MATRIX_B_MEM_SIZE + SCALE_BIAS_SIZE * 2);
 groupshared uint s_SharedMem[SHARED_MEMORY_SIZE];
 
 // Shared memory address calculation functions
-
-int GetHighResLatentAddress(int latentIdx, int x, int y)
-{
-    return HR_LATENT_BASE_ADDR + (latentIdx * HR_LATENTS_HEIGHT + y) * HR_LATENTS_WIDTH + x;
-}
-
-int GetLowResLatentAddress(int latentIdx, int x, int y)
-{
-    return LR_LATENT_BASE_ADDR + (latentIdx * LR_LATENTS_HEIGHT + y) * LR_LATENTS_WIDTH + x;
-}
 
 int GetMatrixBAddress(int col, int row)
 {
@@ -72,106 +56,6 @@ int GetScaleAddress(int index)
 int GetOutputAddress(int ch, int2 threadIdx)
 {
     return (threadIdx.y * DECOMPRESS_CS_BLOCK_WIDTH + threadIdx.x) * (OUTPUT_UINTS+1) + ch;
-}
-
-template<bool HIGH_RES>
-void PreloadLatents(
-    NtcLatentEncodingConstants encoding,
-    NtcNeuralMipConstants neuralMip,
-    float2 colorToNeuralScale,
-    int2 baseLatentPos,
-    int latentOffset,
-    int2 threadIndex)
-{
-    // Rename the threads into a 2D group of a different size, iterate over partitions of that group
-    // if the original group size is smaller.
-    const int groupWidth = int(ceil(float(DECOMPRESS_CS_BLOCK_WIDTH) * colorToNeuralScale.x)) + PRELOAD_MARGIN;
-    const int groupHeight = int(ceil(float(DECOMPRESS_CS_BLOCK_HEIGHT) * colorToNeuralScale.y)) + PRELOAD_MARGIN;
-    int linearThreadIndex = threadIndex.x + threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH;
-    while (linearThreadIndex < groupWidth * groupHeight)
-    {
-        const int2 renamedThreadIdx = int2(linearThreadIndex % groupWidth, linearThreadIndex / groupWidth);
-        const int2 sliceOrigin = int2(neuralMip.sliceLeft, neuralMip.sliceTop);
-        const int2 sliceSize = int2(neuralMip.sliceWidth, neuralMip.sliceHeight);
-        const int2 latentPos = clamp(baseLatentPos + renamedThreadIdx - sliceOrigin, 0, sliceSize - 1);
-        int addr = (latentPos.y * neuralMip.sliceWidth + latentPos.x) * encoding.numFeatures;
-        
-        for (int i = 0; i < encoding.numFeatures / 4; i++)
-        {
-            int4 inp = NtcLoadFourInputQuantizedLatents(t_InputFile, 0, encoding, neuralMip, addr);
-            addr += 4;
-            
-            int sharedAddr = HIGH_RES
-                ? GetHighResLatentAddress(latentOffset + i, renamedThreadIdx.x, renamedThreadIdx.y)
-                : GetLowResLatentAddress(latentOffset + i, renamedThreadIdx.x, renamedThreadIdx.y);
-
-            s_SharedMem[sharedAddr] = NtcPackInt8x4(inp);
-        }
-        linearThreadIndex += DECOMPRESS_CS_BLOCK_WIDTH * DECOMPRESS_CS_BLOCK_HEIGHT;
-    }
-}
-
-template<int NUM_FEATURES, bool ALL_CORNERS, bool HIGH_RES>
-void SampleLatentGridShared(
-    NtcLatentEncodingConstants encoding,
-    NtcNeuralMipConstants neuralMip,
-    float2 uv,
-    int2 baseLatentPos,
-    int latentOffset,
-    int outputOffset,
-    inout uint outputArray[Params::INPUT_CHANNELS / 4])
-{
-    int2 topLeftPos;
-    float4 weights;
-    NtcSetupLatentBilinearFilter(neuralMip, uv, topLeftPos, weights);
-    int4 iweights = int4(weights * 256.f);
-    
-    // Shift right the interpolated weights by 8 to undo the 256 factor above
-    const int normalizationShift = 8;
-    
-    const int2 sharedPos = topLeftPos - baseLatentPos;
-    
-    for (int i = 0; i < encoding.numFeatures / 4; i++)
-    {
-        const int sharedAddr00 = HIGH_RES
-            ? GetHighResLatentAddress(latentOffset + i, sharedPos.x, sharedPos.y)
-            : GetLowResLatentAddress(latentOffset + i, sharedPos.x, sharedPos.y);
-        const int sharedAddr01 = HIGH_RES
-            ? GetHighResLatentAddress(latentOffset + i, sharedPos.x + 1, sharedPos.y)
-            : GetLowResLatentAddress(latentOffset + i, sharedPos.x + 1, sharedPos.y);
-        const int sharedAddr10 = HIGH_RES
-            ? GetHighResLatentAddress(latentOffset + i, sharedPos.x, sharedPos.y + 1)
-            : GetLowResLatentAddress(latentOffset + i, sharedPos.x, sharedPos.y + 1);
-        const int sharedAddr11 = HIGH_RES
-            ? GetHighResLatentAddress(latentOffset + i, sharedPos.x + 1, sharedPos.y + 1)
-            : GetLowResLatentAddress(latentOffset + i, sharedPos.x + 1, sharedPos.y + 1);
-
-        const uint32_t u00 = s_SharedMem[sharedAddr00];
-        const uint32_t u01 = s_SharedMem[sharedAddr01];
-        const uint32_t u10 = s_SharedMem[sharedAddr10];
-        const uint32_t u11 = s_SharedMem[sharedAddr11];
-
-        // Unpack the latents into int4's for blending and multiply by weights.
-        const int4 x00 = NtcUnpackInt8x4(u00) * iweights.x;
-        const int4 x01 = NtcUnpackInt8x4(u01) * iweights.y;
-        const int4 x10 = NtcUnpackInt8x4(u10) * iweights.z;
-        const int4 x11 = NtcUnpackInt8x4(u11) * iweights.w;
-
-        if (ALL_CORNERS)
-        {
-            // Copy the latents for the 4 pixels into the network inputs.
-            outputArray[outputOffset + i + (NUM_FEATURES / 4) * 0] = NtcPackInt8x4(x00 >> normalizationShift);
-            outputArray[outputOffset + i + (NUM_FEATURES / 4) * 1] = NtcPackInt8x4(x01 >> normalizationShift);
-            outputArray[outputOffset + i + (NUM_FEATURES / 4) * 2] = NtcPackInt8x4(x10 >> normalizationShift);
-            outputArray[outputOffset + i + (NUM_FEATURES / 4) * 3] = NtcPackInt8x4(x11 >> normalizationShift);
-        }
-        else
-        {
-            // Blend the features of the 4 pixels.
-            int4 d = (x00 + x01 + x10 + x11) >> normalizationShift;
-            outputArray[outputOffset + i] = NtcPackInt8x4(d);
-        }
-    }
 }
 
 template<int IN, int OUT, bool OUT_FLOAT>
@@ -312,62 +196,13 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
     const int2 dstPosition = pixelPosition + int2(g_Const.dstLeft - g_Const.srcLeft, g_Const.dstTop - g_Const.srcTop);
     const NtcColorMipConstants colorMip = NtcUnpackColorMipConstants(g_Const.colorMip);
     const float2 colorMipSize = float2(g_Const.imageWidth, g_Const.imageHeight);
-    const NtcNeuralMipConstants highResNeuralMip = NtcUnpackNeuralMipConstants(g_Const.highResNeuralMip);
-    const NtcNeuralMipConstants lowResNeuralMip = NtcUnpackNeuralMipConstants(g_Const.lowResNeuralMip);
-
-#if PRELOAD_LATENTS
-    // Preload the block of latents needed to decompress all pixels in this thread group
-    const float2 highResNeuralMipSize = float2(highResNeuralMip.imageWidth, highResNeuralMip.imageHeight);
-    const float2 lowResNeuralMipSize = float2(lowResNeuralMip.imageWidth, lowResNeuralMip.imageHeight);
-    const float2 highResNeuralScale = highResNeuralMipSize / colorMipSize;
-    const float2 lowResNeuralScale = lowResNeuralMipSize / colorMipSize;
-
-    const float2 groupBase = float2(pixelPosition - threadIndex) + 0.5;
-    const int2 baseHighResLatentPos = int2(floor(groupBase * highResNeuralScale)) - 1;
-    const int2 baseLowResLatentPos = int2(floor(groupBase * lowResNeuralScale)) - 1;
-
-    PreloadLatents<true>(NtcUnpackLatentEncodingConstants(g_Const.highResEncoding),
-        highResNeuralMip, highResNeuralScale, baseHighResLatentPos, 0, threadIndex);
-    PreloadLatents<false>(NtcUnpackLatentEncodingConstants(g_Const.lowResEncoding),
-        lowResNeuralMip, lowResNeuralScale, baseLowResLatentPos, Params::HR_FEATURES / 4, threadIndex);
-    GroupMemoryBarrierWithGroupSync();
-#endif
-
-    uint networkInputs[Params::INPUT_CHANNELS / 4];
-
-    // Zero init the array - in some cases, INPUT_CHANNELS is rounded up from the actual used size.
-    // DXC rightfully complains about the use of uninitialized variables in this case.
-    [unroll]
-    for (int i = 0; i < Params::INPUT_CHANNELS / 4; ++i)
-        networkInputs[i] = 0;
-
-    int inputOffset = 0;
+    
     const float2 uv = (float2(pixelPosition) + 0.5) / colorMipSize;
 
-#if PRELOAD_LATENTS
-    // Sample the latent grids from preloaded data
-    SampleLatentGridShared<Params::HR_FEATURES, true, true>(NtcUnpackLatentEncodingConstants(g_Const.highResEncoding),
-        highResNeuralMip, uv, baseHighResLatentPos, 0, inputOffset, networkInputs);
-    inputOffset += Params::SAMPLED_FEATURES_HR / 4;
+    uint networkInputs[Params::INPUT_CHANNELS / 4];
+    NtcPrepareNetworkInputsInternal<NETWORK_VERSION>(t_Latents, s_LatentSampler,
+        pixelPosition, uv, colorMip, networkInputs);
 
-    SampleLatentGridShared<Params::LR_FEATURES, false, false>(NtcUnpackLatentEncodingConstants(g_Const.lowResEncoding),
-        lowResNeuralMip, uv, baseLowResLatentPos, Params::HR_FEATURES / 4, inputOffset, networkInputs);
-    inputOffset += Params::SAMPLED_FEATURES_LR / 4;
-#else
-    // Sample the latent grids
-    NtcSampleLatentGrid<Params::HR_FEATURES, true>(t_InputFile, 0, NtcUnpackLatentEncodingConstants(g_Const.highResEncoding),
-        highResNeuralMip, uv, inputOffset, networkInputs);
-    inputOffset += Params::SAMPLED_FEATURES_HR / 4;
-    
-    NtcSampleLatentGrid<Params::LR_FEATURES, false>(t_InputFile, 0, NtcUnpackLatentEncodingConstants(g_Const.lowResEncoding),
-        lowResNeuralMip, uv, inputOffset, networkInputs);
-    inputOffset += Params::SAMPLED_FEATURES_LR / 4;
-#endif
-
-    // Encode the sample position
-    NtcEncodeSamplePosition(float2(pixelPosition) * colorMip.positionScale,
-        colorMip.positionLod, inputOffset, networkInputs);
-    
     int scaleBiasOffset = g_Const.networkScaleBiasOffset;
 
     // Evaluate the MLP layers:

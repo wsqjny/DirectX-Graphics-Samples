@@ -20,8 +20,9 @@
 typedef NtcNetworkParams<NETWORK_VERSION> NtcParams;
 
 ConstantBuffer<NtcTextureSetConstants> g_NtcMaterial : register(b0);
-ByteAddressBuffer t_InputFile : register(t0);
+Texture2DArray t_Latents : register(t0);
 ByteAddressBuffer t_WeightBuffer : register(t1);
+SamplerState t_LatentSampler : register(s0);
 RWTexture2D<float4> u_Output : register(u0);
 
 [numthreads(1,1,1)]
@@ -30,10 +31,10 @@ void main()
     float channels[NtcParams::OUTPUT_CHANNELS];
 
     #if USE_FP8
-        NtcSampleTextureSet_CoopVec_FP8<NETWORK_VERSION>(g_NtcMaterial, t_InputFile, 0,
+        NtcSampleTextureSet_CoopVec_FP8<NETWORK_VERSION>(g_NtcMaterial, t_Latents, t_LatentSampler,
             t_WeightBuffer, 0, 0, 0, true, channels);
     #else
-        NtcSampleTextureSet_CoopVec_Int8<NETWORK_VERSION>(g_NtcMaterial, t_InputFile, 0,
+        NtcSampleTextureSet_CoopVec_Int8<NETWORK_VERSION>(g_NtcMaterial, t_Latents, t_LatentSampler,
             t_WeightBuffer, 0, 0, 0, true, channels);
     #endif
 

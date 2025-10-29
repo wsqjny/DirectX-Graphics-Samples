@@ -10,7 +10,7 @@
 //*********************************************************
 
 
-#define NETWORK_VERSION 3
+#define NETWORK_VERSION 2
 
 #include "ThirdParty/libntc/include/libntc/shaders/InferenceConstants.h"
 //#include "ThirdParty/libntc/include/libntc/shaders/Inference.hlsli"
@@ -31,7 +31,7 @@ struct PSInput
 
 Texture2D g_texture : register(t0);
 
-ByteAddressBuffer t_InputFile : register(t1);
+Texture2DArray t_Latents : register(t1);
 ByteAddressBuffer t_WeightBuffer : register(t2);
 StructuredBuffer<NtcTextureSetConstants> t_ConstantBuffer : register(t3);
 
@@ -44,14 +44,14 @@ PSInput VSMain(float4 position : POSITION, float4 uv : TEXCOORD)
     PSInput result;
 
     result.position = position;
-    result.uv = uv;
+    result.uv = uv.xy;
 
     return result;
 }
 
-float3 SampleNTC(NtcTextureSetConstants g_NtcMaterial, ByteAddressBuffer t_InputFile, ByteAddressBuffer t_WeightBuffer, float2 uv)
+float3 SampleNTC(NtcTextureSetConstants g_NtcMaterial, Texture2DArray t_Latents, ByteAddressBuffer t_WeightBuffer, SamplerState s_LatentSampler, float2 uv)
 {
-    int mipLevel = 5;
+    int mipLevel = 0;
 
     const int2 textureSize = NtcGetTextureDimensions(g_NtcMaterial, mipLevel);
     int2 texel = int2(floor(uv* textureSize));
@@ -61,18 +61,8 @@ float3 SampleNTC(NtcTextureSetConstants g_NtcMaterial, ByteAddressBuffer t_Input
 
     // Decompress the texel and get all the channels.
     float channels[NtcParams::OUTPUT_CHANNELS];
-#ifdef USE_COOPVEC
-#if USE_FP8
-    NtcSampleTextureSet_CoopVec_FP8<NETWORK_VERSION>(g_NtcMaterial, t_InputFile, 0,
+    NtcSampleTextureSet<NETWORK_VERSION>(g_NtcMaterial, t_Latents, s_LatentSampler,
         t_WeightBuffer, 0, texel, mipLevel, linearizeColorsOnSample, channels);
-#else
-    NtcSampleTextureSet_CoopVec_Int8<NETWORK_VERSION>(g_NtcMaterial, t_InputFile, 0,
-        t_WeightBuffer, 0, texel, mipLevel, linearizeColorsOnSample, channels);
-#endif
-#else
-    NtcSampleTextureSet<NETWORK_VERSION>(g_NtcMaterial, t_InputFile, 0,
-        t_WeightBuffer, 0, texel, mipLevel, linearizeColorsOnSample, channels);
-#endif
 
     float3 baseOrDiffuse = 1;
     baseOrDiffuse = float3(channels[0], channels[1], channels[2]);
@@ -86,6 +76,6 @@ float4 PSMain(PSInput input) : SV_TARGET
 
     //return g_texture.Sample(g_sampler, input.uv);
 
-    float3 sample_result = SampleNTC(t_ConstantBuffer[0], t_InputFile, t_WeightBuffer, input.uv);
+    float3 sample_result = SampleNTC(t_ConstantBuffer[0], t_Latents, t_WeightBuffer, g_sampler, input.uv);
     return float4(sample_result, 1);
 }

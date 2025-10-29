@@ -17,8 +17,10 @@
 
 #include <dxcapi.h> // DXC
 
-extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 717; }
+extern "C" { __declspec(dllexport) extern const UINT D3D12SDKVersion = 616; }
 extern "C" { __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\"; }
+
+std::vector< ComPtr<ID3D12Resource> > g_uploadBuffers;
 
 D3D12HelloTexture::D3D12HelloTexture(UINT width, UINT height, std::wstring name) :
     DXSample(width, height, name),
@@ -55,8 +57,8 @@ void D3D12HelloTexture::LoadPipeline()
     }
 #endif
 
-    UUID Features[] = { D3D12ExperimentalShaderModels, D3D12CooperativeVectorExperiment };
-    ThrowIfFailed(D3D12EnableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr));
+    //UUID Features[] = { D3D12ExperimentalShaderModels, D3D12CooperativeVectorExperiment };
+    //ThrowIfFailed(D3D12EnableExperimentalFeatures(_countof(Features), Features, nullptr, nullptr));
 
     ComPtr<IDXGIFactory4> factory;
     ThrowIfFailed(CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&factory)));
@@ -84,6 +86,8 @@ void D3D12HelloTexture::LoadPipeline()
         ));
     }
 
+
+#if 0
     D3D12_FEATURE_DATA_D3D12_OPTIONS_EXPERIMENTAL FeatureDataTier = {};
     ThrowIfFailed(m_device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS_EXPERIMENTAL,
         &FeatureDataTier,
@@ -102,7 +106,9 @@ void D3D12HelloTexture::LoadPipeline()
             m_osSupportsCoopVec = true;
         }
     }
-    
+#endif
+
+
     // Describe and create the command queue.
     D3D12_COMMAND_QUEUE_DESC queueDesc = {};
     queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
@@ -188,12 +194,12 @@ void D3D12HelloTexture::LoadAssets()
         }
 
         D3D12_STATIC_SAMPLER_DESC sampler = {};
-        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-        sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+        sampler.Filter = D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         sampler.MipLODBias = 0;
-        sampler.MaxAnisotropy = 0;
+        sampler.MaxAnisotropy = 1.0;
         sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
         sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
         sampler.MinLOD = 0.0f;
@@ -617,6 +623,22 @@ inline void log_error(const char* fmt, ...)
     log_warning(fmt);
 }
 
+ComPtr<ID3D12Resource> AllocateUploadBuffer(
+	ID3D12Device* device,
+	SIZE_T bufferSize)
+{
+	ComPtr<ID3D12Resource> uploadBuffer;
+	ThrowIfFailed(device->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(bufferSize),
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(&uploadBuffer)));
+	g_uploadBuffers.push_back(uploadBuffer);
+	return uploadBuffer;
+}
+
 
 GPUBufferWithSRV CreateStructuredOrRawSRVBuffer(
     ID3D12Device* device,
@@ -641,14 +663,6 @@ GPUBufferWithSRV CreateStructuredOrRawSRVBuffer(
         nullptr,
         IID_PPV_ARGS(&result.Buffer)));
 
-    ThrowIfFailed(device->CreateCommittedResource(
-        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
-        D3D12_HEAP_FLAG_NONE,
-        &CD3DX12_RESOURCE_DESC::Buffer(dataSize),
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr,
-        IID_PPV_ARGS(&result.UploadBuffer)));
-
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -663,6 +677,51 @@ GPUBufferWithSRV CreateStructuredOrRawSRVBuffer(
     return result;
 }
 
+GPUTextureWithSRV CreateTexture(ID3D12Device* device,
+    ID3D12GraphicsCommandList* cmdList,
+	uint32_t width,
+    uint32_t height, 
+    uint32_t arraySize,
+    uint32_t mipLevels,
+    DXGI_FORMAT resourceFormat,
+    DXGI_FORMAT srvFormat,
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpuHandle)
+{
+    GPUTextureWithSRV result = {};
+    result.SrvCpuHandle = srvCpuHandle;
+
+    // Describe and create a Texture2D.
+    D3D12_RESOURCE_DESC textureDesc = {};
+    textureDesc.Width = width;
+    textureDesc.Height = height;
+    textureDesc.MipLevels = mipLevels;
+    textureDesc.Format = resourceFormat;
+    textureDesc.DepthOrArraySize = arraySize;
+    textureDesc.SampleDesc.Count = 1;
+    textureDesc.SampleDesc.Quality = 0;
+    textureDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+
+    ThrowIfFailed(device->CreateCommittedResource(
+        &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+        D3D12_HEAP_FLAG_NONE,
+        &textureDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&result.Texture)));
+
+    // Describe and create a SRV for the texture.
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Format = srvFormat;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    srvDesc.Texture2DArray.MipLevels = mipLevels;
+    srvDesc.Texture2DArray.ArraySize = arraySize;
+    device->CreateShaderResourceView(result.Texture.Get(), &srvDesc, srvCpuHandle);
+
+    return result;
+}
+
 void WriteBuffer(
     ID3D12Device* device,
     ID3D12GraphicsCommandList* cmdList,
@@ -670,20 +729,66 @@ void WriteBuffer(
     const void* initData,
     SIZE_T dataSize)
 {
-    void* mapped = nullptr;
-    ThrowIfFailed(src.UploadBuffer->Map(0, nullptr, &mapped));
-    memcpy(mapped, initData, dataSize);
-    src.UploadBuffer->Unmap(0, nullptr);
+	ComPtr<ID3D12Resource> UploadBuffer = AllocateUploadBuffer(device, dataSize);
 
-    cmdList->CopyBufferRegion(src.Buffer.Get(), 0, src.UploadBuffer.Get(), 0, dataSize);
+    void* mapped = nullptr;
+    ThrowIfFailed(UploadBuffer->Map(0, nullptr, &mapped));
+    memcpy(mapped, initData, dataSize);
+    UploadBuffer->Unmap(0, nullptr);
+
+    cmdList->CopyBufferRegion(src.Buffer.Get(), 0, UploadBuffer.Get(), 0, dataSize);
 }
 
+void WriteTexture(ID3D12Device* device,
+    ID3D12GraphicsCommandList* cmdList, 
+    const GPUTextureWithSRV& texture,
+    uint32_t arraySlice, uint32_t mipLevel, const void* data, size_t rowPitch, size_t depthPitch)
+{
+    D3D12_RESOURCE_DESC resourceDesc = texture.Texture->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+    uint32_t numRows;
+    uint64_t rowSizeInBytes;
+    uint64_t totalBytes;
+
+    uint32_t subresource = D3D12CalcSubresource(mipLevel, arraySlice, 0, resourceDesc.MipLevels, resourceDesc.DepthOrArraySize);    
+
+    device->GetCopyableFootprints(&resourceDesc, subresource, 1, 0, &footprint, &numRows, &rowSizeInBytes, &totalBytes);
+    
+    ComPtr<ID3D12Resource> UploadBuffer = AllocateUploadBuffer(device, totalBytes);
+
+    void* cpuVA = nullptr;
+    ThrowIfFailed(UploadBuffer->Map(0, nullptr, &cpuVA));
+    
+    assert(numRows <= footprint.Footprint.Height);
+    for (uint32_t depthSlice = 0; depthSlice < footprint.Footprint.Depth; depthSlice++)
+    {
+        for (uint32_t row = 0; row < numRows; row++)
+        {
+            void* destAddress = (char*)cpuVA + uint64_t(footprint.Footprint.RowPitch) * uint64_t(row + depthSlice * numRows);
+            const void* srcAddress = (const char*)data + rowPitch * row + depthPitch * depthSlice;
+            memcpy(destAddress, srcAddress, min(rowPitch, rowSizeInBytes));
+        }
+    }    
+    UploadBuffer->Unmap(0, nullptr);
+
+    D3D12_TEXTURE_COPY_LOCATION destCopyLocation;
+    destCopyLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destCopyLocation.SubresourceIndex = subresource;
+    destCopyLocation.pResource = texture.Texture.Get();
+
+    D3D12_TEXTURE_COPY_LOCATION srcCopyLocation;
+    srcCopyLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcCopyLocation.PlacedFootprint = footprint;
+    srcCopyLocation.pResource = UploadBuffer.Get();
+
+    cmdList->CopyTextureRegion(&destCopyLocation, 0, 0, 0, &srcCopyLocation, nullptr);
+}
 
 bool D3D12HelloTexture::LoadNTCFile()
 {    
     bool enableCoopVecInt8 = true;
     bool enableCoopVecFP8 = true;
-    const char* ntcFileName = "GlassPlasticMat.ntc";
+    const char* ntcFileName = "BCLatentsNTC.ntc";// "GlassPlasticMat.ntc";
     
     m_osSupportsCoopVec = false;
     ntc::InferenceWeightType weightType = m_osSupportsCoopVec ? ntc::InferenceWeightType::CoopVecFP8 : ntc::InferenceWeightType::GenericInt8;
@@ -695,8 +800,8 @@ bool D3D12HelloTexture::LoadNTCFile()
     contextParams.d3d12Device = m_device.Get();
     contextParams.graphicsDeviceSupportsDP4a = true;// IsDP4aSupported(m_device);
     contextParams.graphicsDeviceSupportsFloat16 = true;// IsFloat16Supported(m_device);
-    contextParams.enableCooperativeVectorInt8 = m_osSupportsCoopVec && enableCoopVecInt8;
-    contextParams.enableCooperativeVectorFP8 = m_osSupportsCoopVec && enableCoopVecFP8;
+    contextParams.enableCooperativeVectorInt8 = false;
+    contextParams.enableCooperativeVectorFP8 = false;
 
     ntc::Status ntcStatus = ntc::CreateContext(m_ntcContext.ptr(), contextParams);
     if (ntcStatus != ntc::Status::Ok && ntcStatus != ntc::Status::CudaUnavailable)
@@ -720,65 +825,14 @@ bool D3D12HelloTexture::LoadNTCFile()
         return false;
     }
 
-    int mip_start = 5;
+    int mip_start = 0;
     
     int networkVersion = textureSetMetadata->GetNetworkVersion();
-
-    ntc::StreamRange latentStreamRange;
-    ntcStatus = textureSetMetadata->GetStreamRangeForLatents(mip_start, 1, latentStreamRange);
-
-
-
-
-
-    {
-        ntc::StreamRange latentStreamRange0;
-        
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(0, 12, latentStreamRange0);            // 35588, 2236928
-        
-        
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(0, 1, latentStreamRange0);             // 35588, 2097152
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(1, 1, latentStreamRange0);             // 35588, 2097152           
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(2, 1, latentStreamRange0);             // 35588, 2097152        
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(3, 1, latentStreamRange0);             // 35588, 2097152   
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(4, 1, latentStreamRange0);             // 2132740, 131072
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(5, 1, latentStreamRange0);             // 2132740, 131072     
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(6, 1, latentStreamRange0);             // 2263812, 8192      
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(7, 1, latentStreamRange0);             // 2263812, 8192      
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(8, 1, latentStreamRange0);             // 2272004, 512        
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(9, 1, latentStreamRange0);             // 2272004, 512      
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(10, 1, latentStreamRange0);            // 2272004, 512
-        ntcStatus = textureSetMetadata->GetStreamRangeForLatents(11, 1, latentStreamRange0);            // 2272004, 512
-
-    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    if (ntcStatus != ntc::Status::Ok)
-    {
-        log_warning("Cannot process material, call to GetStreamRangeForLatents failed, error code = %s: %s", /*ntcMaterial->name.c_str()*/ ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
-    }
 
 
     //- PrepareMaterialForInferenceOnSample
     ntc::InferenceData inferenceData;
-    ntcStatus = m_ntcContext->MakeInferenceData(textureSetMetadata, latentStreamRange, weightType, &inferenceData);
+    ntcStatus = m_ntcContext->MakeInferenceData(textureSetMetadata, weightType, &inferenceData);
     if (ntcStatus != ntc::Status::Ok)
     {
         log_warning("Failed to make inference data for material, error code = %s: %s",
@@ -797,30 +851,17 @@ bool D3D12HelloTexture::LoadNTCFile()
         return false;
     }
 
-
-    std::vector<uint8_t> latentData;
-    latentData.resize(latentStreamRange.size);
-    ntcFileStream->Seek(latentStreamRange.offset);
-    if (!ntcFileStream->Read(latentData.data(), latentData.size()))
-    {
-        log_warning("Failed to read latents for materia");
-        return false;
-    }
-
    
     //- Create Buffer
     D3D12_CPU_DESCRIPTOR_HANDLE handle0                 = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
-    D3D12_CPU_DESCRIPTOR_HANDLE handle_latantBuffer     = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 1, m_cbv_srv_uavDescriptorSize);
+    D3D12_CPU_DESCRIPTOR_HANDLE handle_latant           = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 1, m_cbv_srv_uavDescriptorSize);
     D3D12_CPU_DESCRIPTOR_HANDLE handle_weightBuffer     = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 2, m_cbv_srv_uavDescriptorSize);
     D3D12_CPU_DESCRIPTOR_HANDLE handle_constantBuffer   = CD3DX12_CPU_DESCRIPTOR_HANDLE(handle0, 3, m_cbv_srv_uavDescriptorSize);
-
-    m_LatentBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), latentData.size(), handle_latantBuffer);
-    m_WeightBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), convertedWeightSize ? convertedWeightSize : weightSize, handle_weightBuffer);
-    m_ConstantBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), sizeof(inferenceData.constants), handle_constantBuffer, true, sizeof(inferenceData.constants));
-   
-    WriteBuffer(m_device.Get(), m_commandList.Get(), m_LatentBuffer, latentData.data(), latentData.size());
+       
+    m_ConstantBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), sizeof(inferenceData.constants), handle_constantBuffer, true, sizeof(inferenceData.constants));    
     WriteBuffer(m_device.Get(), m_commandList.Get(), m_ConstantBuffer, &inferenceData.constants, sizeof(inferenceData.constants));
 
+    m_WeightBuffer = CreateStructuredOrRawSRVBuffer(m_device.Get(), m_commandList.Get(), convertedWeightSize ? convertedWeightSize : weightSize, handle_weightBuffer);
     if (convertedWeightSize != 0)
     {
 
@@ -856,4 +897,56 @@ bool D3D12HelloTexture::LoadNTCFile()
     {
         WriteBuffer(m_device.Get(), m_commandList.Get(), m_WeightBuffer, weightData, weightSize);
     }
+
+
+    //- Latent
+    ntc::LatentTextureDesc const latentTextureDescSrc = textureSetMetadata->GetLatentTextureDesc();
+    m_LatentTexture = CreateTexture(
+        m_device.Get(), 
+        m_commandList.Get(),
+        latentTextureDescSrc.width,
+        latentTextureDescSrc.height,
+        latentTextureDescSrc.arraySize,
+        latentTextureDescSrc.mipLevels,
+        DXGI_FORMAT_BC1_UNORM,
+        DXGI_FORMAT_BC1_UNORM,
+        handle_latant);
+
+    std::vector<uint8_t> latentData;
+    for (int mipLevel = 0; mipLevel < latentTextureDescSrc.mipLevels; ++mipLevel)
+    {
+        ntc::LatentTextureFootprint footprint;
+        ntc::Status ntcStatus = textureSetMetadata->GetLatentTextureFootprint(mipLevel, footprint);
+        if (ntcStatus != ntc::Status::Ok)
+        {
+          //  log::warning("Failed to get latent texture footprint for material '%s' mip %d, error code = %s: %s",
+          //      material.name.c_str(), mipLevel, ntc::StatusToString(ntcStatus), ntc::GetLastErrorMessage());
+            return false;
+        }
+
+        latentData.resize(footprint.range.size);
+
+        stream->Seek(footprint.range.offset);
+        if (!stream->Read(latentData.data(), latentData.size()))
+        {
+            //log::warning("Failed to read latents for material '%s'", material.name.c_str());
+            return false;
+        }
+
+        uint8_t const* srcData = latentData.data();
+
+        for (int layerIndex = 0; layerIndex < latentTextureDescSrc.arraySize; ++layerIndex)
+        {
+            WriteTexture(m_device.Get(), m_commandList.Get(), m_LatentTexture, layerIndex, mipLevel, srcData, footprint.rowPitch, 0);
+
+            srcData += footprint.slicePitch;
+        }
+    }
+
+    m_commandList->ResourceBarrier(
+        1,
+        &CD3DX12_RESOURCE_BARRIER::Transition(
+            m_LatentTexture.Texture.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));    
 }

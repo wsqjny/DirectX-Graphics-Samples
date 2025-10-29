@@ -131,19 +131,13 @@ constexpr uint8_t BlockCompressionMaxQuality = 255;
 // This struct defines the shape of the latent space, i.e. compressed representation of the textures.
 struct LatentShape
 {
-    int gridSizeScale = 4;
-    int highResFeatures = 16;
-    int lowResFeatures = 16;
-    int highResQuantBits = 2;
-    int lowResQuantBits = 4;
+    int gridSizeScale = 2;
+    int numFeatures = 9;
 
     bool operator==(const LatentShape& other) const
     {
         return gridSizeScale == other.gridSizeScale
-            && highResFeatures == other.highResFeatures
-            && lowResFeatures == other.lowResFeatures
-            && highResQuantBits == other.highResQuantBits
-            && lowResQuantBits == other.lowResQuantBits;
+            && numFeatures == other.numFeatures;
     }
 
     bool operator!=(const LatentShape& other) const
@@ -153,7 +147,7 @@ struct LatentShape
 
     static constexpr LatentShape Empty()
     {
-        return LatentShape{ 0, 0, 0, 0, 0 };
+        return LatentShape{ 0, 0 };
     }
 
     bool IsEmpty() const
@@ -316,13 +310,6 @@ struct Point
 {
     int x = 0;
     int y = 0;
-
-    Point()
-    { }
-
-    Point(int _x, int _y)
-        : x(_x), y(_y)
-    { }
 };
 
 struct Rect
@@ -331,17 +318,6 @@ struct Rect
     int top = 0;
     int width = 0;
     int height = 0;
-
-    Rect()
-    { }
-    
-    Rect(int _width, int _height)
-        : left(0), top(0), width(_width), height(_height)
-    { }
-
-    Rect(int _left, int _top, int _width, int _height)
-        : left(_left), top(_top), width(_width), height(_height)
-    { }
 };
 
 class ISharedTexture
@@ -512,6 +488,25 @@ struct ShuffleSource
     }
 };
 
+// Describes the properties of the latent texture that is used for graphics decompression.
+struct LatentTextureDesc
+{
+    int width = 0;
+    int height = 0;
+    int arraySize = 0;
+    int mipLevels = 0;
+    // Format is always BC1_UNORM.
+};
+
+// Describes the layout of a latent texture mip level in the compressed file or stream.
+struct LatentTextureFootprint
+{
+    StreamRange range;
+    int widthBlocks = 0;
+    int heightBlocks = 0;
+    size_t rowPitch = 0; // In bytes
+    size_t slicePitch = 0; // In bytes
+};
 
 // The ITextureSetMetadata interface is used to provide information about texture set contents without allocating memory
 // for the actual texture data. This should be useful when decompressing textures at game load time,
@@ -550,9 +545,12 @@ public:
     // which version of the neural network (MLP) should be used to decode this texture set.
     virtual int GetNetworkVersion() const = 0;
 
-    // Returns the range of data from the compressed stream or file that contains all latents needed
-    // to decompress the specified range of mip levels.
-    virtual Status GetStreamRangeForLatents(int firstMip, int numMips, StreamRange& outRange) const = 0;
+    // Returns the descriptor for the latent texture.
+    virtual LatentTextureDesc GetLatentTextureDesc() const = 0;
+
+    // Returns the range and layout of data from the compressed stream or file that contains the BC1 data
+    // for the requested mip level of the latent texture.
+    virtual Status GetLatentTextureFootprint(int latentMipLevel, LatentTextureFootprint& outFootprint) const = 0;
 
     // Returns the range of mip levels including 'mipLevel' that are represented by the same latent image.
     // If a slice of any of these mips is requested for partial inference, scaled slices of all of them
@@ -942,9 +940,6 @@ struct MakeDecompressionComputePassParameters
     // The metadata for the NTC texture set to decompress.
     ITextureSetMetadata* textureSetMetadata = nullptr;
 
-    // Specifies which part of the input stream or file is available as a latent buffer.
-    StreamRange latentStreamRange = EntireStream;
-
     // Specifies which version of the inference weights is to be used for decompression.
     // The weights must be obtained using ITextureSetMetadata::GetInferenceWeights(...) and optionally converted
     // to a CoopVec compatible layout using ITextureSetMetadata::ConvertInferenceWeights(...).
@@ -1099,8 +1094,9 @@ public:
     // Describes a compute pass that decompresses a certain mip level of an NTC texture set into texture objects.
     // The following resources need to be bound to the pipeline:
     // - ConstantBuffer at b0 containing the CB data (ComputePassDecs::constantBufferData) (Vulkan: dset 0, binding 0)
-    // - ByteAddressBuffer at t1 containing the latent data (the latentStreamRange portion of the compressed stream) (Vulkan: dset 0, binding 1)
+    // - Texture2DArray at t1 containing the latent data (Vulkan: dset 0, binding 1)
     // - ByteAddressBuffer at t2 containing the weight data (ITextureSetMetadata::GetInferenceWeights) (Vulkan: dset 0, binding 2)
+    // - SamplerState at s3 with a bilinear wrap sampler (Vulkan: dset 0, binding 3)
     // - Unsized array of RWTexture2D<float4> at u0... containing the UAVs for the destination textures (Vulkan: dset 1, binding 0)
     // If this function returns Status::ShaderUnavailable, the rest of the data in 'pOutComputePass' is still valid.
     virtual Status MakeDecompressionComputePass(MakeDecompressionComputePassParameters const& params,
@@ -1132,31 +1128,13 @@ public:
     // and the weights buffer. To sample a neural texture set, include "libntc/shaders/Inference.hlsli"
     // and call the NtcSampleTextureSet(...) function, providing the constants and weights returned by this function,
     // as well a portion of the NTC file as the 'latentsBuffer' parameter.
-    // The 'latentStreamRange' parameter specifies which part of the input stream or file is available as the latent buffer.
     // The 'weightType' parameter indicates which math version the inference pass will use.
     // If this parameter is true but the extensions are unavailable, the function will return Status::Unsuppported.
     // Note that this function does not validate that the provided latent stream range contains the mip levels
     // that will be sampled; failure to provide necessary data will lead to silent corruption.
-    virtual Status MakeInferenceData(ITextureSetMetadata* textureSetMetadata, StreamRange latentStreamRange,
+    virtual Status MakeInferenceData(ITextureSetMetadata* textureSetMetadata,
         InferenceWeightType weightType, InferenceData* pOutInferenceData) const = 0;
 
-    // Populates the data necessary to run inference on sample with the given texture set for a subset of the pixels.
-    // The subset of latent data is read from the stream and placed into the provided buffer at 'pOutLatentData',
-    // whose size is provided in 'pInOutLatentSize', and the actual written size is returned through the same parameter.
-    // When 'pOutLatentData' is NULL, the required buffer size is returned in 'pInOutLatentSize', and the function
-    // returns Status::Incomplete. No stream reading is done in that case, and 'inputStream' may be NULL.
-    virtual Status MakePartialInferenceData(ITextureSetMetadata* textureSetMetadata, IStream* inputStream,
-        int firstMipLevel, int numMipLevels, Rect firstMipSlice,
-        InferenceWeightType weightType, InferenceData* pOutInferenceData, void* pOutLatentData, size_t* pInOutLatentSize) const = 0;
-
-    // Calculates the buffer size that will be sufficient to extract a portion of latent data for any
-    // pixel rectangle of given size by MakePartialInferenceData(...). The size is returned through 'pOutLatentSize'.
-    // The 'sliceAlignment' parameter specifies that the slice origins will be placed at a multiple of some number,
-    // which may reduce the memory requirements.
-    virtual Status GetConservativeLatentBufferSize(ITextureSetMetadata* textureSetMetadata,
-        int firstMipLevel, int numMipLevels, int firstMipSliceWidth, int firstMipSliceHeight, int sliceAlignment,
-        size_t* pOutLatentSize) const = 0;
-    
     // Returns true if the graphics device supports all the required features and extensions for cooperative vector
     // based decompression of NTC texture sets using Int8 math.
     virtual bool IsCooperativeVectorInt8Supported() const = 0;
@@ -1270,13 +1248,6 @@ NTC_API float LossToPSNR(float loss);
 // with the provided description. The estimate does not include the file headers (typically less than 1 KB).
 NTC_API Status EstimateCompressedTextureSetSize(TextureSetDesc const& textureSetDesc,
     LatentShape const& latentShape, size_t& outSize);
-
-// Returns the number of known latent shapes, to be used with EnumerateKnownLatentShapes(...)
-NTC_API int GetKnownLatentShapeCount(int networkVersion);
-
-// Returns one known latent shape by index. Known means it performs well for the given BPP value compared
-// to other latent shapes that result in the same BPP value.
-NTC_API Status EnumerateKnownLatentShapes(int index, int networkVersion, float& outBitsPerPixel, LatentShape& outShape);
 
 // Selects a known-good latent shape for the provided bitsPerPixel value, with 25% tolerance.
 // When no fitting latent shape can be found, returns Status::OutOfRange.

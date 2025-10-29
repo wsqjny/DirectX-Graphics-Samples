@@ -32,71 +32,41 @@ void NtcCoopVecStoreHalf4(inout CoopVec<float16_t, SIZE> vec, int offset, float1
     vec[offset + 3] = values.w;
 }
 
-float16_t4 NtcLoadFourInputQuantizedLatents_FP16(
-    ByteAddressBuffer buffer,
-    uint bufferOffset,
-    NtcLatentEncodingConstants encoding,
-    NtcNeuralMipConstants neuralMip,
-    int addr)
-{
-    uint4 bits = NtcLoadFourRawLatents(buffer, bufferOffset, encoding, neuralMip, addr);
-
-    // TODO: pass the parameters as float16 in the CB
-    return float16_t4(bits.xyzw) * float16_t(asfloat(encoding.quantizedScale)) + float16_t(asfloat(encoding.quantizedBias));
-}
-
-NTC_TEMPLATE_FN_3(bool, NtcSampleLatentGrid_FP16, int, NUM_FEATURES, bool, ALL_CORNERS, int, OUTPUT_SIZE)
-    (ByteAddressBuffer buffer,
-    uint bufferOffset,
-    NtcLatentEncodingConstants encoding,
-    NtcNeuralMipConstants neuralMip,
+NTC_TEMPLATE_FN_2(bool, NtcSampleLatentGrid_FP16, int, NUM_FEATURES, int, OUTPUT_SIZE)
+    (Texture2DArray latentTexture,
+    SamplerState latentSampler,
     float2 uv,
-    int outputOffset,
+    int neuralLod,
+    int featureOffset,
     inout CoopVec<float16_t, OUTPUT_SIZE> outputArray)
 {
-    if (neuralMip.sliceWidth == 0 || neuralMip.sliceHeight == 0)
-        return false;
+    int width, height, arraySize;
+    latentTexture.GetDimensions(width, height, arraySize);
 
-    int2 topLeftPos;
-    float4 weights;
-    NtcSetupLatentBilinearFilter(neuralMip, uv, topLeftPos, weights);
-    float16_t4 iweights = float16_t4(weights);
+    width = max(width >> neuralLod, 1);
+    height = max(height >> neuralLod, 1);
+    const float2 invSize = float2(1.0f / width, 1.0f / height);
 
-    const int x0 = min(max(topLeftPos.x, 0), neuralMip.sliceWidth - 1);
-    const int y0 = min(max(topLeftPos.y, 0), neuralMip.sliceHeight - 1);
-    const int x1 = min(max(topLeftPos.x + 1, 0), neuralMip.sliceWidth - 1);
-    const int y1 = min(max(topLeftPos.y + 1, 0), neuralMip.sliceHeight - 1);
-
-    int a00 = (y0 * neuralMip.sliceWidth + x0) * encoding.numFeatures;
-    int a01 = (y0 * neuralMip.sliceWidth + x1) * encoding.numFeatures;
-    int a10 = (y1 * neuralMip.sliceWidth + x0) * encoding.numFeatures;
-    int a11 = (y1 * neuralMip.sliceWidth + x1) * encoding.numFeatures;
-
+#if __SLANG__
+    [ForceUnroll]
+#else
     [unroll]
-    for (int i = 0; i < NUM_FEATURES / 4; i++)
+#endif
+    for (int layerIndex = 0; layerIndex < NUM_FEATURES / 3; ++layerIndex)
     {
-        if (i >= encoding.numFeatures / 4)
+        if (layerIndex >= arraySize)
             break;
 
-        float16_t4 x00 = NtcLoadFourInputQuantizedLatents_FP16(buffer, bufferOffset, encoding, neuralMip, a00) * iweights.x; a00 += 4;
-        float16_t4 x01 = NtcLoadFourInputQuantizedLatents_FP16(buffer, bufferOffset, encoding, neuralMip, a01) * iweights.y; a01 += 4;
-        float16_t4 x10 = NtcLoadFourInputQuantizedLatents_FP16(buffer, bufferOffset, encoding, neuralMip, a10) * iweights.z; a10 += 4;
-        float16_t4 x11 = NtcLoadFourInputQuantizedLatents_FP16(buffer, bufferOffset, encoding, neuralMip, a11) * iweights.w; a11 += 4;
+        float3 sampledValue = latentTexture.SampleLevel(latentSampler, float3(uv, layerIndex), neuralLod).xyz;
+        sampledValue = sampledValue * 2.f - 1.f;
+        
+        outputArray[featureOffset + layerIndex * 3 + 0] = float16_t(sampledValue.x);
+        outputArray[featureOffset + layerIndex * 3 + 1] = float16_t(sampledValue.y);
+        outputArray[featureOffset + layerIndex * 3 + 2] = float16_t(sampledValue.z);
 
-        if (ALL_CORNERS)
-        {
-            // Copy the latents for the 4 pixels into the network inputs.
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4 + NUM_FEATURES * 0, x00);
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4 + NUM_FEATURES * 1, x01);
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4 + NUM_FEATURES * 2, x10);
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4 + NUM_FEATURES * 3, x11);
-        }
-        else
-        {
-            // Blend the features of the 4 pixels.
-            float16_t4 d = x00 + x01 + x10 + x11;
-            NtcCoopVecStoreHalf4(outputArray, outputOffset + i * 4, d);
-        }
+        // Offset the sampling UV by one pixel on each array layer.
+        // This should be possible with integer sampling offsets, but DXC fails to generate valid SPIR-V for that.
+        uv += invSize;
     }
 
     return true;
@@ -113,9 +83,13 @@ NTC_TEMPLATE_FN_1(void, NtcEncodeSamplePosition_FP16, int, OUTPUT_SIZE)
     for (; scale > 1; scale >>= 1)
     {
         float4 enc = NtcEvaluatePositionalEncoding(posf, iscale);
-        NtcCoopVecStoreHalf4(outputArray, idx, float16_t4(enc));
 
-        idx+=4;
+        outputArray[idx + 0] = float16_t(enc.x);
+        outputArray[idx + 1] = float16_t(enc.y);
+        outputArray[idx + 2] = float16_t(enc.z);
+        outputArray[idx + 3] = float16_t(enc.w);
+
+        idx += 4;
         iscale *= 2;
     }
     
@@ -123,10 +97,44 @@ NTC_TEMPLATE_FN_1(void, NtcEncodeSamplePosition_FP16, int, OUTPUT_SIZE)
     outputArray[idx+1] = float16_t(lod);
 }
 
+NTC_TEMPLATE_FN_1(bool, NtcPrepareNetworkInputsInternal_FP16, int, VERSION)
+    (Texture2DArray latentTexture,
+    SamplerState latentSampler,
+    int2 texel,
+    float2 uv,
+    const NtcColorMipConstants colorMip,
+    out CoopVec<float16_t, NtcNetworkParams<VERSION>::INPUT_CHANNELS> networkInputs)
+{
+    typedef NtcNetworkParams<VERSION> Params;
+
+    // Zero init the vector
+    [unroll]
+    for (int i = 0; i < Params::INPUT_CHANNELS; ++i)
+        networkInputs[i] = 0;
+
+    if (colorMip.neuralMip < 0)
+        return false;
+
+    // Sample the latent grids
+    if (!NtcSampleLatentGrid_FP16<Params::FEATURES, Params::INPUT_CHANNELS>(latentTexture, latentSampler,
+        uv, colorMip.neuralMip, 0, networkInputs))
+        return false;
+
+    if (!NtcSampleLatentGrid_FP16<Params::FEATURES, Params::INPUT_CHANNELS>(latentTexture, latentSampler,
+        uv, colorMip.neuralMip + 1, Params::FEATURES, networkInputs))
+        return false;
+
+    // Encode the sample position
+    NtcEncodeSamplePosition_FP16<Params::INPUT_CHANNELS>(float2(texel) * colorMip.positionScale,
+        colorMip.positionLod, Params::FEATURES * 2, networkInputs);
+
+    return true;
+}
+
 NTC_TEMPLATE_FN_1(bool, NtcPrepareNetworkInputs_FP16, int, VERSION)
     (NtcTextureSetConstants desc,
-    ByteAddressBuffer latentsBuffer,
-    uint latentsOffset,
+    Texture2DArray latentTexture,
+    SamplerState latentSampler,
     int2 texel,
     int mipLevel,
     inout CoopVec<float16_t, NtcNetworkParams<VERSION>::INPUT_CHANNELS> networkInputs)
@@ -138,31 +146,8 @@ NTC_TEMPLATE_FN_1(bool, NtcPrepareNetworkInputs_FP16, int, VERSION)
 
     const NtcColorMipConstants colorMip = NtcUnpackColorMipConstants(desc.colorMips[mipLevel]);
 
-    if (colorMip.neuralMip < 0)
-        return false;
-
-    int inputOffset = 0;
-
-    // Sample the latent grids
-    if (!NtcSampleLatentGrid_FP16<Params::HR_FEATURES, true, Params::INPUT_CHANNELS>(latentsBuffer, latentsOffset,
-        NtcUnpackLatentEncodingConstants(desc.highResEncoding),
-        NtcUnpackNeuralMipConstants(desc.highResNeuralMips[colorMip.neuralMip]),
-        uv, inputOffset, networkInputs))
-        return false;
-    inputOffset += Params::SAMPLED_FEATURES_HR;
-
-    if (!NtcSampleLatentGrid_FP16<Params::LR_FEATURES, false, Params::INPUT_CHANNELS>(latentsBuffer, latentsOffset,
-        NtcUnpackLatentEncodingConstants(desc.lowResEncoding),
-        NtcUnpackNeuralMipConstants(desc.lowResNeuralMips[colorMip.neuralMip]),
-        uv, inputOffset, networkInputs))
-        return false;
-    inputOffset += Params::SAMPLED_FEATURES_LR;
-
-    // Encode the sample position
-    NtcEncodeSamplePosition_FP16<Params::INPUT_CHANNELS>(float2(texel) * colorMip.positionScale,
-        colorMip.positionLod, inputOffset, networkInputs);
-
-    return true;
+    return NtcPrepareNetworkInputsInternal_FP16<VERSION>(latentTexture, latentSampler,
+        texel, uv, colorMip, networkInputs);
 }
 
 
@@ -429,7 +414,6 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, A
     (ByteAddressBuffer weightBuffer,
     int weightOffset,
     uint scaleBiasOffset,
-    int totalChannels,
     bool scaleActivation,
     in CoopVec<float16_t, IN> inputArray,
     out CoopVec<float16_t, OUT> outputArray)
@@ -490,8 +474,8 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, A
 // Returns true if the mip level is valid; out-of-bounds texel positions are clamped.
 NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_Int8, int, VERSION)
     (NtcTextureSetConstants desc,
-    ByteAddressBuffer latentsBuffer,
-    uint latentsOffset, // Offset of the latents chunk in latentsBuffer if packing multiple textures together
+    Texture2DArray latentTexture,
+    SamplerState latentSampler,
     ByteAddressBuffer weightsBuffer,
     uint weightsOffset, // Offset of the weight chunk in weightsBuffer if packing multiple textures together
     int2 texel,
@@ -502,7 +486,7 @@ NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_Int8, int, VERSION)
     typedef NtcNetworkParams<VERSION> Params;
 
     uint networkInputs[Params::INPUT_CHANNELS / 4];
-    if (!NtcPrepareNetworkInputs<VERSION>(desc, latentsBuffer, latentsOffset, texel, mipLevel, networkInputs))
+    if (!NtcPrepareNetworkInputs<VERSION>(desc, latentTexture, latentSampler, texel, mipLevel, networkInputs))
         return false;
 
     int scaleBiasOffset = weightsOffset + desc.networkScaleBiasOffset;
@@ -561,8 +545,8 @@ NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_Int8, int, VERSION)
 // Returns true if the mip level is valid; out-of-bounds texel positions are clamped.
 NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_FP8, int, VERSION)
     (NtcTextureSetConstants desc,
-    ByteAddressBuffer latentsBuffer,
-    uint latentsOffset, // Offset of the latents chunk in latentsBuffer if packing multiple textures together
+    Texture2DArray latentTexture,
+    SamplerState latentSampler,
     ByteAddressBuffer weightsBuffer,
     uint weightsOffset, // Offset of the weight chunk in weightsBuffer if packing multiple textures together
     int2 texel,
@@ -573,7 +557,7 @@ NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_FP8, int, VERSION)
     typedef NtcNetworkParams<VERSION> Params;
 
     CoopVec<float16_t, Params::INPUT_CHANNELS> networkInputs;
-    if (!NtcPrepareNetworkInputs_FP16<VERSION>(desc, latentsBuffer, latentsOffset, texel, mipLevel, networkInputs))
+    if (!NtcPrepareNetworkInputs_FP16<VERSION>(desc, latentTexture, latentSampler, texel, mipLevel, networkInputs))
         return false;
 
     int scaleBiasOffset = weightsOffset + desc.networkScaleBiasOffset;
@@ -584,7 +568,7 @@ NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_FP8, int, VERSION)
     // Input layer
     CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput1;
     NtcEvaluateLayer_CoopVec_FP8<Params::INPUT_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.x, scaleBiasOffset, totalChannels, false, networkInputs, hiddenOutput1);
+    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.x, scaleBiasOffset, false, networkInputs, hiddenOutput1);
     // Advance scaleBiasOffset to point at the next layer - it's here as a workaround for a Slang bug
     // that prevents it from compiling EvaluateLayer_CoopVec with scaleBiasOffset as 'inout' parameter.
     scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
@@ -592,13 +576,13 @@ NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_FP8, int, VERSION)
     // Hidden layer 1
     CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput2;
     NtcEvaluateLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.y, scaleBiasOffset, totalChannels, false, hiddenOutput1, hiddenOutput2);
+    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.y, scaleBiasOffset, false, hiddenOutput1, hiddenOutput2);
     scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
     
     // Hidden layer 2
     CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput3;
     NtcEvaluateLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.z, scaleBiasOffset, totalChannels, true, hiddenOutput2, hiddenOutput3);
+    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.z, scaleBiasOffset, true, hiddenOutput2, hiddenOutput3);
     scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
     
     // Output layer

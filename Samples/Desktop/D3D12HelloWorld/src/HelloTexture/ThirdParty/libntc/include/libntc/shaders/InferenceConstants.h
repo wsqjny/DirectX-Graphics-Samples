@@ -31,53 +31,18 @@
 #define NTC_NETWORK_COUNT   (NTC_NETWORK_XLARGE)
 
 #define NTC_MLP_LAYERS                4
-#define NTC_MLP_HR_FEATURES_SMALL     4
-#define NTC_MLP_HR_FEATURES_MEDIUM    8
-#define NTC_MLP_HR_FEATURES_LARGE     12
-#define NTC_MLP_HR_FEATURES_XLARGE    16
-#define NTC_MLP_LR_FEATURES           16
+#define NTC_MLP_FEATURES_SMALL        9  // Feature counts are multiples of 3 because latents are stored in BC1 textures
+#define NTC_MLP_FEATURES_MEDIUM       15 // with no alpha, so each texture can hold 3 features.
+#define NTC_MLP_FEATURES_LARGE        24
+#define NTC_MLP_FEATURES_XLARGE       33
 #define NTC_MLP_POS_ENC_SCALE         8
-#define NTC_MLP_INPUT_CHANNELS_SMALL  48
-#define NTC_MLP_INPUT_CHANNELS_MEDIUM 64
-#define NTC_MLP_INPUT_CHANNELS_LARGE  80
-#define NTC_MLP_INPUT_CHANNELS_XLARGE 96
+#define NTC_MLP_SUPPLEMENTAL_INPUTS   14 // Positional encoding (12 inputs) and the mip level (twice)
+#define NTC_MLP_INPUT_CHANNELS_SMALL  32 // roundup(NTC_MLP_SUPPLEMENTAL_INPUTS + NTC_MLP_FEATURES_SMALL  * 2, 16)
+#define NTC_MLP_INPUT_CHANNELS_MEDIUM 48 // roundup(NTC_MLP_SUPPLEMENTAL_INPUTS + NTC_MLP_FEATURES_MEDIUM * 2, 16)
+#define NTC_MLP_INPUT_CHANNELS_LARGE  64 // roundup(NTC_MLP_SUPPLEMENTAL_INPUTS + NTC_MLP_FEATURES_LARGE  * 2, 16)
+#define NTC_MLP_INPUT_CHANNELS_XLARGE 80 // roundup(NTC_MLP_SUPPLEMENTAL_INPUTS + NTC_MLP_FEATURES_XLARGE * 2, 16)
 #define NTC_MLP_HIDDEN_CHANNELS       64
 #define NTC_MLP_OUTPUT_CHANNELS       16
-
-struct NtcLatentEncodingConstants
-{
-    int numFeatures;
-    int quantBits;
-    int logElementsPerUint; // == log2(32 / quantBits)
-    int pad;
-
-    NTC_UINT addressMask; // == (1u << logElementsPerUint) - 1u
-    NTC_UINT dataMask;    // == (1u << quantBits) - 1u
-    int quantizedScale;   // scale and bias parameters to translate quantized latent to quantized input
-    int quantizedBias;
-};
-
-struct NtcNeuralMipConstants
-{
-    NTC_UINT dataOffset;
-#ifdef __cplusplus
-    unsigned short imageWidth;
-    unsigned short imageHeight;
-    unsigned short sliceLeft;
-    unsigned short sliceTop;
-    unsigned short sliceWidth;
-    unsigned short sliceHeight;
-#else
-    // Use 32-bit uints in HLSL to avoid compatibility issues.
-    // The struct's binary representation doesn't matter on HLSL side.
-    NTC_UINT sliceLeft;
-    NTC_UINT sliceTop;
-    NTC_UINT sliceWidth;
-    NTC_UINT sliceHeight;
-    NTC_UINT imageWidth;
-    NTC_UINT imageHeight;
-#endif
-};
 
 struct NtcColorMipConstants
 {
@@ -90,19 +55,11 @@ struct NtcColorMipConstants
 struct NtcTextureSetConstants
 {
 #ifdef __cplusplus
-    NtcLatentEncodingConstants highResEncoding;
-    NtcLatentEncodingConstants lowResEncoding;
-    NtcNeuralMipConstants highResNeuralMips[NTC_MAX_NEURAL_MIPS];
-    NtcNeuralMipConstants lowResNeuralMips[NTC_MAX_NEURAL_MIPS];
     NtcColorMipConstants colorMips[NTC_MAX_MIPS];
     int networkWeightOffsets[NTC_MLP_LAYERS];
 #else
     // These structures are packed as int4 for compatibility with engines
     // that don't support structs in constant buffers.
-    int4 highResEncoding[2];
-    int4 lowResEncoding[2];
-    int4 highResNeuralMips[NTC_MAX_NEURAL_MIPS];
-    int4 lowResNeuralMips[NTC_MAX_NEURAL_MIPS];
     int4 colorMips[NTC_MAX_MIPS];
     
     // This maps to the int[] array on the host side
