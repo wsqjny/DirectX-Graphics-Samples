@@ -15,52 +15,65 @@
 #include "DecompressCommon.hlsli"
 #include "libntc/shaders/InferenceCoopVec.hlsli"
 
-groupshared float s_Outputs[DECOMPRESS_CS_BLOCK_HEIGHT * DECOMPRESS_CS_BLOCK_WIDTH * Params::OUTPUT_CHANNELS];
+groupshared float s_Outputs[DECOMPRESS_CS_BLOCK_HEIGHT * DECOMPRESS_CS_BLOCK_WIDTH * NTC_MLP_OUTPUT_CHANNELS];
 
 void DecompressPixel_CoopVec(uint2 globalIndex, uint2 threadIndex)
 {
-    const int2 pixelPosition = int2(globalIndex) + int2(g_Const.gridLeft, g_Const.gridTop);
+    const int2 pixelPosition = int2(globalIndex) + int2(g_Const.srcLeft, g_Const.srcTop);
     const int2 dstPosition = pixelPosition + int2(g_Const.dstLeft - g_Const.srcLeft, g_Const.dstTop - g_Const.srcTop);
     const NtcColorMipConstants colorMip = NtcUnpackColorMipConstants(g_Const.colorMip);
     const float2 colorMipSize = float2(g_Const.imageWidth, g_Const.imageHeight);
 
     const float2 uv = (float2(pixelPosition)+0.5) / float2(g_Const.imageWidth, g_Const.imageHeight);
 
-    CoopVec<float16_t, Params::INPUT_CHANNELS> networkInputs;
-    NtcPrepareNetworkInputsInternal_FP16<NETWORK_VERSION>(t_Latents, s_LatentSampler,
+    CoopVec<float16_t, NTC_MLP_INPUT_CHANNELS> networkInputs;
+    NtcPrepareNetworkInputsInternal_FP16(t_Latents, s_LatentSampler,
         pixelPosition, uv, colorMip, networkInputs);
-
-    int scaleBiasOffset = g_Const.networkScaleBiasOffset;
 
     // Evaluate the MLP layers:
     // Input layer
-    CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput1;
-    NtcEvaluateLayer_CoopVec_FP8<Params::INPUT_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (t_WeightBuffer, g_Const.networkWeightOffsets.x, scaleBiasOffset, false, networkInputs, hiddenOutput1);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
-    
+    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput1;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
+        t_WeightBuffer,
+        g_Const.networkWeightOffsets.x,
+        g_Const.networkBiasOffsets.x,
+        false, networkInputs, hiddenOutput1);
+
     // Hidden layer 1
-    CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput2;
-    NtcEvaluateLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (t_WeightBuffer, g_Const.networkWeightOffsets.y, scaleBiasOffset, false, hiddenOutput1, hiddenOutput2);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
-    
+    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput2;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
+        t_WeightBuffer,
+        g_Const.networkWeightOffsets.y,
+        g_Const.networkBiasOffsets.y,
+        false, hiddenOutput1, hiddenOutput2);
+
     // Hidden layer 2
-    CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput3;
-    NtcEvaluateLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (t_WeightBuffer, g_Const.networkWeightOffsets.z, scaleBiasOffset, true, hiddenOutput2, hiddenOutput3);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
-    
+    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput3;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
+        t_WeightBuffer,
+        g_Const.networkWeightOffsets.z,
+        g_Const.networkBiasOffsets.z,
+        true, hiddenOutput2, hiddenOutput3);
+
     // Output layer
-    CoopVec<float, Params::OUTPUT_CHANNELS> networkOutputs;
-    NtcEvaluateOutputLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::OUTPUT_CHANNELS>
-    (t_WeightBuffer, g_Const.networkWeightOffsets.w, scaleBiasOffset, hiddenOutput3, networkOutputs);
+    CoopVec<float, NTC_MLP_OUTPUT_CHANNELS> networkOutputs;
+    NtcEvaluateOutputLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS>(
+        t_WeightBuffer,
+        g_Const.networkWeightOffsets.w,
+        g_Const.networkBiasOffsets.w,
+        g_Const.networkScaleOffsets.w,
+        hiddenOutput3, networkOutputs);
 
     // Store the outputs into shared memory for efficient indexed access later.
     // Note: there is no need for a barrier before or after this store because we're using a dedicated
     // shared memory array, and each thread only reads the data it's written - nothing from other threads.
-    int threadOffset = (threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH + threadIndex.x) * Params::OUTPUT_CHANNELS;
+    int threadOffset = (threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH + threadIndex.x) * NTC_MLP_OUTPUT_CHANNELS;
+#if __SLANG__
     networkOutputs.store(s_Outputs, threadOffset * sizeof(float));
+#else
+    for (int i = 0; i < NTC_MLP_OUTPUT_CHANNELS; ++i)
+        s_Outputs[threadOffset + i] = networkOutputs[i];
+#endif
     
     HashBasedRNG rng = HashBasedRNG::Create(pixelPosition.x + pixelPosition.y * g_Const.imageWidth, 0);
 

@@ -42,9 +42,13 @@ struct NtcDecompressConstants
 #ifdef __cplusplus
     NtcColorMipConstants colorMip;
     int networkWeightOffsets[4];
+    int networkBiasOffsets[4];
+    int networkScaleOffsets[4];
 #else
     int4 colorMip;
     int4 networkWeightOffsets;
+    int4 networkBiasOffsets;
+    int4 networkScaleOffsets;
 #endif
 
     int srcLeft;
@@ -54,13 +58,13 @@ struct NtcDecompressConstants
 
     int dstLeft;
     int dstTop;
-    int gridLeft;
-    int gridTop;
-
     int imageWidth;
     int imageHeight;
+
     int numOutputs;
-    int networkScaleBiasOffset;
+    int pad0;
+    int pad1;
+    int pad2;
 };
 
 #endif

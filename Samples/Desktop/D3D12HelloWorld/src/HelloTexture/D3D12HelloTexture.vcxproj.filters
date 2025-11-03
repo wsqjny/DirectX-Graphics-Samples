@@ -30,6 +30,9 @@
     <ClInclude Include="Win32Application.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Source\DescriptorHandleAllocator.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="stdafx.cpp">
@@ -47,10 +50,19 @@
     <ClCompile Include="Win32Application.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Source\DescriptorHandleAllocator.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <CustomBuild Include="shaders.hlsl">
+    <None Include="compile_shaders.bat">
       <Filter>Assets\Shaders</Filter>
-    </CustomBuild>
+    </None>
+    <None Include="Shaders\NtcDeompress.hlsl">
+      <Filter>Assets\Shaders</Filter>
+    </None>
+    <None Include="Shaders\shaders.hlsl">
+      <Filter>Assets\Shaders</Filter>
+    </None>
   </ItemGroup>
 </Project>

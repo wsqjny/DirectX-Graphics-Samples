@@ -19,70 +19,47 @@
 
 #include "Inference.hlsli"
 
-#if __SLANG__
-void NtcCoopVecStoreHalf4<let SIZE: int>(inout CoopVec<float16_t, SIZE> vec, int offset, float16_t4 values)
-#else
-template<int SIZE>
-void NtcCoopVecStoreHalf4(inout CoopVec<float16_t, SIZE> vec, int offset, float16_t4 values)
-#endif
-{
-    vec[offset + 0] = values.x;
-    vec[offset + 1] = values.y;
-    vec[offset + 2] = values.z;
-    vec[offset + 3] = values.w;
-}
-
-NTC_TEMPLATE_FN_2(bool, NtcSampleLatentGrid_FP16, int, NUM_FEATURES, int, OUTPUT_SIZE)
-    (Texture2DArray latentTexture,
+bool NtcSampleLatentGrid_FP16(
+    Texture2DArray latentTexture,
     SamplerState latentSampler,
     float2 uv,
     int neuralLod,
     int featureOffset,
-    inout CoopVec<float16_t, OUTPUT_SIZE> outputArray)
+    inout CoopVec<float16_t, NTC_MLP_INPUT_CHANNELS> outputArray)
 {
     int width, height, arraySize;
     latentTexture.GetDimensions(width, height, arraySize);
 
-    width = max(width >> neuralLod, 1);
-    height = max(height >> neuralLod, 1);
-    const float2 invSize = float2(1.0f / width, 1.0f / height);
-
-#if __SLANG__
-    [ForceUnroll]
-#else
     [unroll]
-#endif
-    for (int layerIndex = 0; layerIndex < NUM_FEATURES / 3; ++layerIndex)
+    for (int layerIndex = 0; layerIndex < NTC_MLP_FEATURES / NTC_FEATURES_PER_LAYER; ++layerIndex)
     {
-        if (layerIndex >= arraySize)
-            break;
+        const bool mask = (layerIndex == 0) || (layerIndex < arraySize);
 
-        float3 sampledValue = latentTexture.SampleLevel(latentSampler, float3(uv, layerIndex), neuralLod).xyz;
-        sampledValue = sampledValue * 2.f - 1.f;
+        float4 sampledValue = latentTexture.SampleLevel(latentSampler, float3(uv, layerIndex), neuralLod);
+        sampledValue = sampledValue.bgra; // The texture format is BGRA4, unswizzle that
+        sampledValue = mask ? sampledValue * 2.f - 1.f : 0.f;
         
-        outputArray[featureOffset + layerIndex * 3 + 0] = float16_t(sampledValue.x);
-        outputArray[featureOffset + layerIndex * 3 + 1] = float16_t(sampledValue.y);
-        outputArray[featureOffset + layerIndex * 3 + 2] = float16_t(sampledValue.z);
-
-        // Offset the sampling UV by one pixel on each array layer.
-        // This should be possible with integer sampling offsets, but DXC fails to generate valid SPIR-V for that.
-        uv += invSize;
+        outputArray[featureOffset + layerIndex * NTC_FEATURES_PER_LAYER + 0] = float16_t(sampledValue.x);
+        outputArray[featureOffset + layerIndex * NTC_FEATURES_PER_LAYER + 1] = float16_t(sampledValue.y);
+        outputArray[featureOffset + layerIndex * NTC_FEATURES_PER_LAYER + 2] = float16_t(sampledValue.z);
+        outputArray[featureOffset + layerIndex * NTC_FEATURES_PER_LAYER + 3] = float16_t(sampledValue.w);
     }
 
     return true;
 }
 
-NTC_TEMPLATE_FN_1(void, NtcEncodeSamplePosition_FP16, int, OUTPUT_SIZE)
-    (float2 posf, float lod, int offset, inout CoopVec<float16_t, OUTPUT_SIZE> outputArray)
+void NtcEncodeSamplePosition_FP16(
+    float2 posf,
+    float lod,
+    int offset,
+    inout CoopVec<float16_t, NTC_MLP_INPUT_CHANNELS> outputArray)
 {
     int idx = offset;
-    int scale = NTC_MLP_POS_ENC_SCALE;
-    float iscale = 1.f / scale;
     
     [unroll]
-    for (; scale > 1; scale >>= 1)
+    for (int wave = 0; wave < NTC_MLP_POS_ENC_WAVES; ++wave)
     {
-        float4 enc = NtcEvaluatePositionalEncoding(posf, iscale);
+        float4 enc = NtcEvaluatePositionalEncoding(posf);
 
         outputArray[idx + 0] = float16_t(enc.x);
         outputArray[idx + 1] = float16_t(enc.y);
@@ -90,63 +67,59 @@ NTC_TEMPLATE_FN_1(void, NtcEncodeSamplePosition_FP16, int, OUTPUT_SIZE)
         outputArray[idx + 3] = float16_t(enc.w);
 
         idx += 4;
-        iscale *= 2;
+        posf *= 2.f;
     }
     
-    outputArray[idx+0] = float16_t(lod);
-    outputArray[idx+1] = float16_t(lod);
+    outputArray[idx + 0] = float16_t(lod);
+    outputArray[idx + 1] = float16_t(lod);
 }
 
-NTC_TEMPLATE_FN_1(bool, NtcPrepareNetworkInputsInternal_FP16, int, VERSION)
-    (Texture2DArray latentTexture,
+bool NtcPrepareNetworkInputsInternal_FP16(
+    Texture2DArray latentTexture,
     SamplerState latentSampler,
     int2 texel,
     float2 uv,
     const NtcColorMipConstants colorMip,
-    out CoopVec<float16_t, NtcNetworkParams<VERSION>::INPUT_CHANNELS> networkInputs)
+    out CoopVec<float16_t, NTC_MLP_INPUT_CHANNELS> networkInputs)
 {
-    typedef NtcNetworkParams<VERSION> Params;
-
     // Zero init the vector
     [unroll]
-    for (int i = 0; i < Params::INPUT_CHANNELS; ++i)
+    for (int i = 0; i < NTC_MLP_INPUT_CHANNELS; ++i)
         networkInputs[i] = 0;
 
     if (colorMip.neuralMip < 0)
         return false;
 
     // Sample the latent grids
-    if (!NtcSampleLatentGrid_FP16<Params::FEATURES, Params::INPUT_CHANNELS>(latentTexture, latentSampler,
+    if (!NtcSampleLatentGrid_FP16(latentTexture, latentSampler,
         uv, colorMip.neuralMip, 0, networkInputs))
         return false;
 
-    if (!NtcSampleLatentGrid_FP16<Params::FEATURES, Params::INPUT_CHANNELS>(latentTexture, latentSampler,
-        uv, colorMip.neuralMip + 1, Params::FEATURES, networkInputs))
+    if (!NtcSampleLatentGrid_FP16(latentTexture, latentSampler,
+        uv, colorMip.neuralMip + 1, NTC_MLP_FEATURES, networkInputs))
         return false;
 
     // Encode the sample position
-    NtcEncodeSamplePosition_FP16<Params::INPUT_CHANNELS>(float2(texel) * colorMip.positionScale,
-        colorMip.positionLod, Params::FEATURES * 2, networkInputs);
+    NtcEncodeSamplePosition_FP16(float2(texel) * colorMip.positionScale,
+        colorMip.positionLod, NTC_MLP_FEATURES * 2, networkInputs);
 
     return true;
 }
 
-NTC_TEMPLATE_FN_1(bool, NtcPrepareNetworkInputs_FP16, int, VERSION)
-    (NtcTextureSetConstants desc,
+bool NtcPrepareNetworkInputs_FP16(
+    NtcTextureSetConstants desc,
     Texture2DArray latentTexture,
     SamplerState latentSampler,
     int2 texel,
     int mipLevel,
-    inout CoopVec<float16_t, NtcNetworkParams<VERSION>::INPUT_CHANNELS> networkInputs)
+    inout CoopVec<float16_t, NTC_MLP_INPUT_CHANNELS> networkInputs)
 {
-    typedef NtcNetworkParams<VERSION> Params;
-
     const int2 imageSize = NtcGetTextureDimensions(desc, mipLevel);
     const float2 uv = (float2(texel) + 0.5) / imageSize;
 
     const NtcColorMipConstants colorMip = NtcUnpackColorMipConstants(desc.colorMips[mipLevel]);
 
-    return NtcPrepareNetworkInputsInternal_FP16<VERSION>(latentTexture, latentSampler,
+    return NtcPrepareNetworkInputsInternal_FP16(latentTexture, latentSampler,
         texel, uv, colorMip, networkInputs);
 }
 
@@ -190,32 +163,29 @@ void NtcHGELUClamp_Forward_CoopVec(inout CoopVec<T, SIZE> x, bool scaleAndBias)
 
 #if __SLANG__
     inline void NtcEvaluateLayerMatMulAdd_CoopVec_Int8
-        <T_IN: __BuiltinArithmeticType, let T_IN_NUM: int, let IN_IS_PACKED: bool, let IN: int, let OUT: int>
+        <T_IN: __BuiltinArithmeticType, let IN: int, let OUT: int>
 #else
-    template<typename T_IN, int T_IN_NUM, bool IN_IS_PACKED, int IN, int OUT>
+    template<typename T_IN, int IN, int OUT>
     void NtcEvaluateLayerMatMulAdd_CoopVec_Int8
 #endif
     (ByteAddressBuffer weightBuffer,
     int weightOffset,
     int biasOffset,
-    in CoopVec<T_IN, T_IN_NUM> inputArray,
+    in CoopVec<T_IN, IN> inputArray,
     out CoopVec<float, OUT> outputArray)
 {
 #if __SLANG__
 
-    const CoopVecComponentType inputType = IN_IS_PACKED
-        ? CoopVecComponentType::SignedInt8Packed
-        : CoopVecComponentType::SignedInt8;
+    const CoopVecComponentType inputType = CoopVecComponentType::SignedInt8;
     const CoopVecComponentType weightType = CoopVecComponentType::SignedInt8;
     const CoopVecMatrixLayout weightLayout = CoopVecMatrixLayout::InferencingOptimal;
     const CoopVecComponentType biasType = CoopVecComponentType::SignedInt32;
     const uint stride = 0;
 
     CoopVec<int, OUT> accum;
-    accum = coopVecMatMulAddPacked<int, OUT, T_IN_NUM, T_IN>(
+    accum = coopVecMatMulAdd<int, OUT, IN, T_IN>(
         inputArray,
         inputType,
-        IN,
         weightBuffer,
         weightOffset,
         weightType,
@@ -234,7 +204,7 @@ void NtcHGELUClamp_Forward_CoopVec(inout CoopVec<T, SIZE> x, bool scaleAndBias)
     // See https://microsoft.github.io/hlsl-specs/proposals/0031-hlsl-vector-matrix-operations.html
     // for the enum value definitions
     
-    const uint inputType = IN_IS_PACKED ? 17 /* SINT8_T4_PACKED */ : 20 /* SINT8 */;
+    const uint inputType = 20; // SINT8
     const uint weightType = 20; // SINT8
     const uint weightLayout = 2; // MUL_OPTIMAL
     const uint biasType = 4; // SINT32
@@ -245,7 +215,7 @@ void NtcHGELUClamp_Forward_CoopVec(inout CoopVec<T, SIZE> x, bool scaleAndBias)
         accum,
         false,
         inputArray,
-        IN_IS_PACKED,
+        false,
         inputType,
         weightBuffer,
         weightOffset,
@@ -261,56 +231,6 @@ void NtcHGELUClamp_Forward_CoopVec(inout CoopVec<T, SIZE> x, bool scaleAndBias)
     );
     
     outputArray = accum;
-#endif
-}
-
-NTC_TEMPLATE_FN_2(void, NtcEvaluateLayerMatMul_CoopVec_FP8, int, IN, int, OUT)
-    (ByteAddressBuffer weightBuffer,
-    int weightOffset,
-    in CoopVec<float16_t, IN> inputArray,
-    out CoopVec<float16_t, OUT> outputArray)
-{
-#if __SLANG__
-
-    const CoopVecComponentType inputType = CoopVecComponentType::FloatE4M3;
-    const CoopVecComponentType weightType = CoopVecComponentType::FloatE4M3;
-    const CoopVecMatrixLayout weightLayout = CoopVecMatrixLayout::InferencingOptimal;
-    const uint stride = 0;
-
-    outputArray = coopVecMatMul<float16_t, OUT, IN, float16_t>(
-        inputArray,
-        inputType,
-        weightBuffer,
-        weightOffset,
-        weightType,
-        weightLayout,
-        false,
-        stride
-    );
-
-#else
-
-    const uint inputType = 21; // F8_E4M3
-    const uint weightType = 21; // F8_E4M3
-    const uint weightLayout = 2; // MATRIX_LAYOUT_MUL_OPTIMAL
-    const uint stride = 0;
-
-    __builtin_MatVecMul(
-        outputArray,
-        false,
-        inputArray,
-        false,
-        inputType,
-        weightBuffer,
-        weightOffset,
-        weightType,
-        OUT,
-        IN,
-        weightLayout,
-        false,
-        stride
-    );
-
 #endif
 }
 
@@ -373,47 +293,10 @@ NTC_TEMPLATE_FN_2(void, NtcEvaluateLayerMatMulAdd_CoopVec_FP8, int, IN, int, OUT
 #endif
 }
 
-#if __SLANG__
-    inline void NtcEvaluateLayer_CoopVec_Int8
-        <T_IN: __BuiltinArithmeticType, let T_IN_NUM: int, let IN_IS_PACKED: bool, let IN: int, let OUT: int, let ACT: bool>
-#else
-    template<typename T_IN, int T_IN_NUM, bool IN_IS_PACKED, int IN, int OUT, bool ACT>
-    void NtcEvaluateLayer_CoopVec_Int8
-#endif
-    (ByteAddressBuffer weightBuffer,
-    int weightOffset,
-    uint scaleBiasOffset,
-    int totalChannels,
-    in CoopVec<T_IN, T_IN_NUM> inputArray,
-    out CoopVec<float, OUT> outputArray)
-{
-    // See the comment block in the beginning of TextureSet.cpp for the weight layouts
-
-    const uint biasOffset = scaleBiasOffset + totalChannels * sizeof(float);
-    
-    NtcEvaluateLayerMatMulAdd_CoopVec_Int8<T_IN, T_IN_NUM, IN_IS_PACKED, IN, OUT>
-        (weightBuffer, weightOffset, biasOffset, inputArray, outputArray);
-    
-    // Enforce the scale alignment to help the compiler optimize the code
-    scaleBiasOffset &= ~15;
-    
-#if __SLANG__
-    let scale = CoopVec<float, OUT>.load(weightBuffer, scaleBiasOffset);
-#else
-    CoopVec<float, OUT> scale = weightBuffer.Load<CoopVec<float, OUT> >(scaleBiasOffset);
-#endif
-    outputArray = outputArray * scale;
-
-    if (ACT)
-    {
-        NtcHGELUClamp_Forward_CoopVec<float, OUT>(outputArray, true);
-    }
-}
-
 NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, ACT)
     (ByteAddressBuffer weightBuffer,
     int weightOffset,
-    uint scaleBiasOffset,
+    int biasOffset,
     bool scaleActivation,
     in CoopVec<float16_t, IN> inputArray,
     out CoopVec<float16_t, OUT> outputArray)
@@ -421,7 +304,7 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, A
     // See the comment block in the beginning of TextureSet.cpp for the weight layouts
 
     NtcEvaluateLayerMatMulAdd_CoopVec_FP8<IN, OUT>
-        (weightBuffer, weightOffset, scaleBiasOffset, inputArray, outputArray);
+        (weightBuffer, weightOffset, biasOffset, inputArray, outputArray);
    
     if (ACT)
     {
@@ -438,7 +321,8 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, A
 #endif
     (ByteAddressBuffer weightBuffer,
     int weightOffset,
-    uint scaleBiasOffset,
+    int biasOffset,
+    int scaleOffset,
     in CoopVec<float16_t, IN> inputArray,
     out CoopVec<float, OUT> outputArray)
 {
@@ -452,99 +336,26 @@ NTC_TEMPLATE_FN_3(void, NtcEvaluateLayer_CoopVec_FP8, int, IN, int, OUT, bool, A
     inputArrayFloat = inputArray;
 #endif
 
-    const int biasOffset = scaleBiasOffset + OUT * sizeof(float);
-
-    NtcEvaluateLayerMatMulAdd_CoopVec_Int8<float, IN, false, IN, OUT>
+    NtcEvaluateLayerMatMulAdd_CoopVec_Int8<float, IN, OUT>
         (weightBuffer, weightOffset, biasOffset, inputArrayFloat, outputArray);
     
     // Enforce the scale alignment to help the compiler optimize the code
-    scaleBiasOffset &= ~15;
+    scaleOffset &= ~15;
     
 #if __SLANG__
-    let scale = CoopVec<float, OUT>.load(weightBuffer, scaleBiasOffset);
+    let scale = CoopVec<float, OUT>.load(weightBuffer, scaleOffset);
 #else
-    CoopVec<float, OUT> scale = weightBuffer.Load<CoopVec<float, OUT> >(scaleBiasOffset);
+    CoopVec<float, OUT> scale = weightBuffer.Load<CoopVec<float, OUT> >(scaleOffset);
 #endif
 
     outputArray = outputArray * scale;
 }
 
-// NtcSampleTextureSet_CoopVec_Int8 - version of NtcSampleTextureSet that uses Cooperative Vectors with Int8 math.
-// Use like SampleTextureSet_CoopVec_Int8<NETWORK_VERSION>(Constants, LatentsBuffer, ...)
-// Returns true if the mip level is valid; out-of-bounds texel positions are clamped.
-NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_Int8, int, VERSION)
-    (NtcTextureSetConstants desc,
-    Texture2DArray latentTexture,
-    SamplerState latentSampler,
-    ByteAddressBuffer weightsBuffer,
-    uint weightsOffset, // Offset of the weight chunk in weightsBuffer if packing multiple textures together
-    int2 texel,
-    int mipLevel,
-    bool convertToLinearColorSpace,
-    inout float outputs[NtcNetworkParams<VERSION>::OUTPUT_CHANNELS])
-{
-    typedef NtcNetworkParams<VERSION> Params;
-
-    uint networkInputs[Params::INPUT_CHANNELS / 4];
-    if (!NtcPrepareNetworkInputs<VERSION>(desc, latentTexture, latentSampler, texel, mipLevel, networkInputs))
-        return false;
-
-    int scaleBiasOffset = weightsOffset + desc.networkScaleBiasOffset;
-
-    // Evaluate the MLP layers:
-    const int totalChannels = Params::HIDDEN_LAYER_CHANNELS * 3 + Params::OUTPUT_CHANNELS;
-
-    CoopVec<uint32_t, Params::INPUT_CHANNELS / 4> networkInputsVec;
-    [unroll]
-    for (int i = 0; i < Params::INPUT_CHANNELS / 4; ++i)
-    {
-        networkInputsVec[i] = networkInputs[i];
-    }
-
-    // Input layer
-    CoopVec<float, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput1;
-    NtcEvaluateLayer_CoopVec_Int8<uint32_t, Params::INPUT_CHANNELS/4, true, Params::INPUT_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.x, scaleBiasOffset, totalChannels, networkInputsVec, hiddenOutput1);
-    // Advance scaleBiasOffset to point at the next layer - it's here as a workaround for a Slang bug
-    // that prevents it from compiling EvaluateLayer_CoopVec_Int8 with scaleBiasOffset as 'inout' parameter.
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float);
-    
-    // Hidden layer 1
-    CoopVec<float, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput2;
-    NtcEvaluateLayer_CoopVec_Int8<float, Params::HIDDEN_LAYER_CHANNELS, false, Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.y, scaleBiasOffset, totalChannels, hiddenOutput1, hiddenOutput2);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float);
-    
-    // Hidden layer 2
-    CoopVec<float, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput3;
-    NtcEvaluateLayer_CoopVec_Int8<float, Params::HIDDEN_LAYER_CHANNELS, false, Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.z, scaleBiasOffset, totalChannels, hiddenOutput2, hiddenOutput3);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float);
-    
-    // Output layer
-    CoopVec<float, Params::OUTPUT_CHANNELS> networkOutputs;
-    NtcEvaluateLayer_CoopVec_Int8<float, Params::HIDDEN_LAYER_CHANNELS, false, Params::HIDDEN_LAYER_CHANNELS, Params::OUTPUT_CHANNELS, false>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.w, scaleBiasOffset, totalChannels, hiddenOutput3, networkOutputs);
-
-    [unroll]
-    for (int ch = 0; ch < Params::OUTPUT_CHANNELS; ++ch)
-    {
-        outputs[ch] = networkOutputs[ch];
-        
-        if (convertToLinearColorSpace)
-        {
-            outputs[ch] = NtcConvertChannelToLinearColorSpace(desc, ch, outputs[ch]);
-        }
-    }
-
-    return true;
-}
-
 // NtcSampleTextureSet_CoopVec_FP8 - version of NtcSampleTextureSet that uses Cooperative Vectors with FP8 (E4M3) math.
-// Use like SampleTextureSet_CoopVec_FP8<NETWORK_VERSION>(Constants, LatentsBuffer, ...)
+// Use like SampleTextureSet_CoopVec_FP8(Constants, LatentsBuffer, ...)
 // Returns true if the mip level is valid; out-of-bounds texel positions are clamped.
-NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_FP8, int, VERSION)
-    (NtcTextureSetConstants desc,
+bool NtcSampleTextureSet_CoopVec_FP8(
+    NtcTextureSetConstants desc,
     Texture2DArray latentTexture,
     SamplerState latentSampler,
     ByteAddressBuffer weightsBuffer,
@@ -552,46 +363,49 @@ NTC_TEMPLATE_FN_1(bool, NtcSampleTextureSet_CoopVec_FP8, int, VERSION)
     int2 texel,
     int mipLevel,
     bool convertToLinearColorSpace,
-    inout float outputs[NtcNetworkParams<VERSION>::OUTPUT_CHANNELS])
+    inout float outputs[NTC_MLP_OUTPUT_CHANNELS])
 {
-    typedef NtcNetworkParams<VERSION> Params;
-
-    CoopVec<float16_t, Params::INPUT_CHANNELS> networkInputs;
-    if (!NtcPrepareNetworkInputs_FP16<VERSION>(desc, latentTexture, latentSampler, texel, mipLevel, networkInputs))
+    CoopVec<float16_t, NTC_MLP_INPUT_CHANNELS> networkInputs;
+    if (!NtcPrepareNetworkInputs_FP16(desc, latentTexture, latentSampler, texel, mipLevel, networkInputs))
         return false;
 
-    int scaleBiasOffset = weightsOffset + desc.networkScaleBiasOffset;
-
     // Evaluate the MLP layers:
-    const int totalChannels = Params::HIDDEN_LAYER_CHANNELS * 3 + Params::OUTPUT_CHANNELS;
-
+    const int totalChannels = NTC_MLP_HIDDEN_CHANNELS * 3 + NTC_MLP_OUTPUT_CHANNELS;
+    
     // Input layer
-    CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput1;
-    NtcEvaluateLayer_CoopVec_FP8<Params::INPUT_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.x, scaleBiasOffset, false, networkInputs, hiddenOutput1);
-    // Advance scaleBiasOffset to point at the next layer - it's here as a workaround for a Slang bug
-    // that prevents it from compiling EvaluateLayer_CoopVec with scaleBiasOffset as 'inout' parameter.
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
+    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput1;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
+        weightsBuffer,
+        weightsOffset + desc.networkWeightOffsets.x,
+        weightsOffset + desc.networkBiasOffsets.x,
+        false, networkInputs, hiddenOutput1);
     
     // Hidden layer 1
-    CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput2;
-    NtcEvaluateLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.y, scaleBiasOffset, false, hiddenOutput1, hiddenOutput2);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
+    CoopVec<float16_t, NTC_MLP_HIDDEN_CHANNELS> hiddenOutput2;
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
+        weightsBuffer,
+        weightsOffset + desc.networkWeightOffsets.y,
+        weightsOffset + desc.networkBiasOffsets.y,
+        false, hiddenOutput1, hiddenOutput2);
     
     // Hidden layer 2
-    CoopVec<float16_t, Params::HIDDEN_LAYER_CHANNELS> hiddenOutput3;
-    NtcEvaluateLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, true>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.z, scaleBiasOffset, true, hiddenOutput2, hiddenOutput3);
-    scaleBiasOffset += Params::HIDDEN_LAYER_CHANNELS * sizeof(float16_t);
-    
+    NtcEvaluateLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, true>(
+        weightsBuffer,
+        weightsOffset + desc.networkWeightOffsets.z,
+        weightsOffset + desc.networkBiasOffsets.z,
+        true, hiddenOutput2, hiddenOutput1);
+
     // Output layer
-    CoopVec<float, Params::OUTPUT_CHANNELS> networkOutputs;
-    NtcEvaluateOutputLayer_CoopVec_FP8<Params::HIDDEN_LAYER_CHANNELS, Params::OUTPUT_CHANNELS>
-    (weightsBuffer, weightsOffset + desc.networkWeightOffsets.w, scaleBiasOffset, hiddenOutput3, networkOutputs);
+    CoopVec<float, NTC_MLP_OUTPUT_CHANNELS> networkOutputs;
+    NtcEvaluateOutputLayer_CoopVec_FP8<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS>(
+        weightsBuffer,
+        weightsOffset + desc.networkWeightOffsets.w,
+        weightsOffset + desc.networkBiasOffsets.w,
+        weightsOffset + desc.networkScaleOffsets.w,
+        hiddenOutput1, networkOutputs);
 
     [unroll]
-    for (int ch = 0; ch < Params::OUTPUT_CHANNELS; ++ch)
+    for (int ch = 0; ch < NTC_MLP_OUTPUT_CHANNELS; ++ch)
     {
         outputs[ch] = networkOutputs[ch];
         

@@ -12,19 +12,21 @@
 #pragma once
 
 #include "DXSample.h"
+#include "Source/DescriptorHandleAllocator.h"
 
 using namespace DirectX;
 
 struct GPUBufferWithSRV
 {
     ComPtr<ID3D12Resource> Buffer;
-    D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle;
+    DescriptorHandle SrvHandle;
 };
 
-struct GPUTextureWithSRV
+struct GPUTextureWithSRVUAV
 {
 	ComPtr<ID3D12Resource> Texture;
-	D3D12_CPU_DESCRIPTOR_HANDLE SrvCpuHandle;
+    DescriptorHandle SrvHandle;
+    DescriptorHandle UavHandle;
 };
 
 // Note that while ComPtr is used to manage the lifetime of resources on the CPU,
@@ -67,10 +69,14 @@ private:
     ComPtr<ID3D12RootSignature> m_rootSignature;
     ComPtr<ID3D12DescriptorHeap> m_rtvHeap;
     ComPtr<ID3D12DescriptorHeap> m_srvHeap;
+
     ComPtr<ID3D12PipelineState> m_pipelineState;
     ComPtr<ID3D12GraphicsCommandList> m_commandList;
     UINT m_rtvDescriptorSize;
+    
     UINT m_cbv_srv_uavDescriptorSize;
+    std::unique_ptr<DescriptorHandleAllocator> m_srvAllocator;
+
 
     // App resources.
     ComPtr<ID3D12Resource> m_vertexBuffer;
@@ -93,10 +99,20 @@ private:
     UINT descriptorSize;
     bool m_osSupportsCoopVec;
 
-    GPUTextureWithSRV m_LatentTexture;
+    D3D12_STATIC_SAMPLER_DESC m_NTCSampler;
+
+    GPUTextureWithSRVUAV m_LatentTexture;
     GPUBufferWithSRV m_WeightBuffer;
     GPUBufferWithSRV m_ConstantBuffer;
     ComPtr<ID3D12Resource> m_UploadBuffer;
 
+    int DecompressDispatchXY[2];
+    GPUBufferWithSRV m_ConstantBuffer_NtcDecompress;
+    ComPtr<ID3D12RootSignature> m_rootSignature_CS_NtcDecompress;
+    ComPtr<ID3D12PipelineState> m_pipelineState_CS_NtcDecompress;
+
+    std::vector<GPUTextureWithSRVUAV> m_VecSourceTextures;
+
     bool LoadNTCFile();
+    bool DecompressNTC();
 };

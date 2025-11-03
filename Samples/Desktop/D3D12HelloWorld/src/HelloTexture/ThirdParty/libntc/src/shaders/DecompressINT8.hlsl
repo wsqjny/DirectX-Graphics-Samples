@@ -25,11 +25,7 @@ static const int SCALE_BASE_ADDR = BIAS_BASE_ADDR + SCALE_BIAS_SIZE;
 
 // Second phase - output shuffling
 static const int OUTPUT_BASE_ADDR = 0;
-#if USE_FLOAT16
-static const int OUTPUT_UINTS = Params::OUTPUT_CHANNELS/2;
-#else
-static const int OUTPUT_UINTS = Params::OUTPUT_CHANNELS;
-#endif
+static const int OUTPUT_UINTS = NTC_MLP_OUTPUT_CHANNELS/2;
 static const int OUTPUT_SIZE = DECOMPRESS_CS_BLOCK_WIDTH * DECOMPRESS_CS_BLOCK_HEIGHT * (OUTPUT_UINTS+1);
 
 // Calculate the total shared memory size and allocate it
@@ -61,15 +57,11 @@ int GetOutputAddress(int ch, int2 threadIdx)
 template<int IN, int OUT, bool OUT_FLOAT>
 void EvaluateLayerINT8_SharedMem(
     int weightOffset,
-    inout int scaleBiasOffset,
-    int totalChannels,
+    int biasOffset,
+    int scaleOffset,
     bool activation,
     uint inputArray[IN / 4],
-#if USE_FLOAT16
     out uint outputArray[OUT_FLOAT ? OUT / 2 : OUT / 4],
-#else
-    out uint outputArray[OUT_FLOAT ? OUT : OUT / 4],
-#endif
     int2 threadIndex)
 {
     GroupMemoryBarrierWithGroupSync();
@@ -80,8 +72,8 @@ void EvaluateLayerINT8_SharedMem(
     const int linearThreadIndex = threadIndex.x + threadIndex.y * DECOMPRESS_CS_BLOCK_WIDTH;
     if (linearThreadIndex < OUT)
     {
-        float scale = t_WeightBuffer.Load<float>(scaleBiasOffset + linearThreadIndex * sizeof(float));
-        int bias = t_WeightBuffer.Load<int>(scaleBiasOffset + (totalChannels + linearThreadIndex) * sizeof(int));
+        float scale = t_WeightBuffer.Load<float>(scaleOffset + linearThreadIndex * sizeof(float));
+        int bias = t_WeightBuffer.Load<int>(biasOffset + linearThreadIndex * sizeof(int));
 
         s_SharedMem[GetScaleAddress(linearThreadIndex)] = asuint(scale);
         s_SharedMem[GetBiasAddress(linearThreadIndex)] = asuint(bias);
@@ -100,9 +92,6 @@ void EvaluateLayerINT8_SharedMem(
 
         preloadIndex += DECOMPRESS_CS_BLOCK_WIDTH * DECOMPRESS_CS_BLOCK_HEIGHT;
     }
-
-    // Advance the input offsets to point at the next layer.
-    scaleBiasOffset += OUT * sizeof(float);
 
     GroupMemoryBarrierWithGroupSync();
 
@@ -125,17 +114,10 @@ void EvaluateLayerINT8_SharedMem(
             const int matrixAddr2 = GetMatrixBAddress(c + 2, k);
             const int matrixAddr3 = GetMatrixBAddress(c + 3, k);
 
-#if USE_DP4A
             acc0 = dot4add_i8packed(inputArray[k], s_SharedMem[matrixAddr0], acc0);
             acc1 = dot4add_i8packed(inputArray[k], s_SharedMem[matrixAddr1], acc1);
             acc2 = dot4add_i8packed(inputArray[k], s_SharedMem[matrixAddr2], acc2);
             acc3 = dot4add_i8packed(inputArray[k], s_SharedMem[matrixAddr3], acc3);
-#else
-            acc0 += NtcDotProductInt8x4(inputArray[k], s_SharedMem[matrixAddr0]);
-            acc1 += NtcDotProductInt8x4(inputArray[k], s_SharedMem[matrixAddr1]);
-            acc2 += NtcDotProductInt8x4(inputArray[k], s_SharedMem[matrixAddr2]);
-            acc3 += NtcDotProductInt8x4(inputArray[k], s_SharedMem[matrixAddr3]);
-#endif
         }
 
         float4 results = float4(acc0, acc1, acc2, acc3);
@@ -148,7 +130,6 @@ void EvaluateLayerINT8_SharedMem(
 
         results *= scales;
 
-#if USE_FLOAT16
         float16_t4 hresults = float16_t4(results);
         
         if (activation)
@@ -167,68 +148,54 @@ void EvaluateLayerINT8_SharedMem(
 
             outputArray[c / 4] = NtcPackInt8x4(iresults);
         }
-#else
-        if (activation)
-        {
-            results = NtcHGELUClamp_ForwardFloat(results);
-        }
-
-        if (OUT_FLOAT)
-        {
-            outputArray[c + 0] = asuint(results.x);
-            outputArray[c + 1] = asuint(results.y);
-            outputArray[c + 2] = asuint(results.z);
-            outputArray[c + 3] = asuint(results.w);
-        }
-        else
-        {
-            int4 iresults = NtcHGELUClamp_QuantizeFloat(results);
-
-            outputArray[c / 4] = NtcPackInt8x4(iresults);
-        }
-#endif
     }
 }
 
-void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
+void DecompressPixel(uint2 globalIndex, uint2 threadIndex, NtcDecompressConstants g_Const)
 {
-    const int2 pixelPosition = int2(globalIndex) + int2(g_Const.gridLeft, g_Const.gridTop);
+    const int2 pixelPosition = int2(globalIndex) + int2(g_Const.srcLeft, g_Const.srcTop);
     const int2 dstPosition = pixelPosition + int2(g_Const.dstLeft - g_Const.srcLeft, g_Const.dstTop - g_Const.srcTop);
     const NtcColorMipConstants colorMip = NtcUnpackColorMipConstants(g_Const.colorMip);
     const float2 colorMipSize = float2(g_Const.imageWidth, g_Const.imageHeight);
     
     const float2 uv = (float2(pixelPosition) + 0.5) / colorMipSize;
 
-    uint networkInputs[Params::INPUT_CHANNELS / 4];
-    NtcPrepareNetworkInputsInternal<NETWORK_VERSION>(t_Latents, s_LatentSampler,
+    uint networkInputs[NTC_MLP_INPUT_CHANNELS / 4];
+    NtcPrepareNetworkInputsInternal(t_Latents, s_LatentSampler,
         pixelPosition, uv, colorMip, networkInputs);
 
-    int scaleBiasOffset = g_Const.networkScaleBiasOffset;
-
     // Evaluate the MLP layers:
-    const int totalChannels = Params::HIDDEN_LAYER_CHANNELS * 3 + Params::OUTPUT_CHANNELS;
+    
     // Input layer
-    uint hiddenOutput1[Params::HIDDEN_LAYER_CHANNELS / 4];
-    EvaluateLayerINT8_SharedMem<Params::INPUT_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, false>
-        (g_Const.networkWeightOffsets.x, scaleBiasOffset, totalChannels,  true,
-        networkInputs, hiddenOutput1, threadIndex);
+    uint hiddenOutput1[NTC_MLP_HIDDEN_CHANNELS / 4];
+    EvaluateLayerINT8_SharedMem<NTC_MLP_INPUT_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+        g_Const.networkWeightOffsets.x,
+        g_Const.networkBiasOffsets.x,
+        g_Const.networkScaleOffsets.x,
+        true, networkInputs, hiddenOutput1, threadIndex);
 
     // Hidden layer 1
-    uint hiddenOutput2[Params::HIDDEN_LAYER_CHANNELS / 4];
-    EvaluateLayerINT8_SharedMem<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, false>
-        (g_Const.networkWeightOffsets.y, scaleBiasOffset, totalChannels, true,
-        hiddenOutput1, hiddenOutput2, threadIndex);
+    uint hiddenOutput2[NTC_MLP_HIDDEN_CHANNELS / 4];
+    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+        g_Const.networkWeightOffsets.y,
+        g_Const.networkBiasOffsets.y,
+        g_Const.networkScaleOffsets.y,
+        true, hiddenOutput1, hiddenOutput2, threadIndex);
 
     // Hidden layer 2
-    EvaluateLayerINT8_SharedMem<Params::HIDDEN_LAYER_CHANNELS, Params::HIDDEN_LAYER_CHANNELS, false>
-        (g_Const.networkWeightOffsets.z, scaleBiasOffset, totalChannels, true,
-        hiddenOutput2, hiddenOutput1, threadIndex);
+    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_HIDDEN_CHANNELS, false>(
+        g_Const.networkWeightOffsets.z,
+        g_Const.networkBiasOffsets.z,
+        g_Const.networkScaleOffsets.z,
+        true, hiddenOutput2, hiddenOutput1, threadIndex);
 
     // Output layer
     uint networkOutputs[OUTPUT_UINTS];
-    EvaluateLayerINT8_SharedMem<Params::HIDDEN_LAYER_CHANNELS, Params::OUTPUT_CHANNELS, true>
-        (g_Const.networkWeightOffsets.w, scaleBiasOffset, totalChannels, false,
-        hiddenOutput1, networkOutputs, threadIndex);
+    EvaluateLayerINT8_SharedMem<NTC_MLP_HIDDEN_CHANNELS, NTC_MLP_OUTPUT_CHANNELS, true>(
+        g_Const.networkWeightOffsets.w,
+        g_Const.networkBiasOffsets.w,
+        g_Const.networkScaleOffsets.w,
+        false, hiddenOutput1, networkOutputs, threadIndex);
     
     HashBasedRNG rng = HashBasedRNG::Create(pixelPosition.x + pixelPosition.y * g_Const.imageWidth, 0);
 
@@ -247,9 +214,14 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
         pixelPosition.x >= g_Const.srcRight || pixelPosition.y >= g_Const.srcBottom)
         return;
     
+#if DX12_DEMO
+    for(int outputIndex = 0; outputIndex < 3; ++outputIndex)
+    {
+#else
     // Shuffle the output data into destination textures
     for (int outputIndex = 0; outputIndex < g_Const.numOutputs; ++outputIndex)
     {
+#endif
         const NtcDecompressOutputDesc outputDesc = g_Const.outputs[outputIndex];
         
         // Read 4 channels from the shared buffer
@@ -257,15 +229,11 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
         [unroll]
         for (int ch = 0; ch < 4; ++ch)
         {
-            int srcChannel = min(outputDesc.firstChannel + ch, Params::OUTPUT_CHANNELS - 1);
-#if USE_FLOAT16
+            int srcChannel = min(outputDesc.firstChannel + ch, NTC_MLP_OUTPUT_CHANNELS - 1);
             uint twoCh = s_SharedMem[GetOutputAddress(srcChannel/2, threadIndex)];
             if (srcChannel & 1)
                 twoCh >>= 16;
             texelValue[ch] = asfloat16(uint16_t(twoCh));
-#else
-            texelValue[ch] = asfloat(s_SharedMem[GetOutputAddress(srcChannel, threadIndex)]);
-#endif
         }
 
         // Perform color space conversion, if needed
@@ -281,13 +249,34 @@ void DecompressPixel(uint2 globalIndex, uint2 threadIndex)
         if (outputDesc.numChannels <= 2) texelValue.z = 0;
         if (outputDesc.numChannels <= 3) texelValue.w = 1;
 
+#if DX12_DEMO
+        //u_Outputs[outputIndex][dstPosition] = texelValue;
+        if (outputIndex == 0)
+        {
+            u_OutputBuffers_0[dstPosition] = texelValue;
+		}
+		else if (outputIndex == 1)
+		{
+            u_OutputBuffers_1[dstPosition] = texelValue;
+		}
+		else if (outputIndex == 2)
+		{
+            u_OutputBuffers_2[dstPosition] = texelValue;
+        }
+#else
         // Write out the texel to the UAV
         u_Outputs[outputDesc.textureIndex][dstPosition] = texelValue;
+#endif
     }
 }
+
+
+#if 0
 
 [numthreads(DECOMPRESS_CS_BLOCK_WIDTH, DECOMPRESS_CS_BLOCK_HEIGHT, 1)]
 void main(uint2 globalIndex : SV_DispatchThreadID, uint2 threadIndex : SV_GroupThreadID)
 {
     DecompressPixel(globalIndex, threadIndex);
 }
+
+#endif
